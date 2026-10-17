@@ -17,7 +17,7 @@ SKILL_MD="$REPO_ROOT/SKILL.md"
 RAW_PY="$REPO_ROOT/scripts/boss_cdp_raw.py"
 
 current_version() {
-  grep -m1 '^version:' "$SKILL_MD" | sed 's/version:[[:space:]]*//'
+  sed -n 's/^  version: "\(.*\)"/\1/p' "$SKILL_MD" | head -n1
 }
 
 version_in_raw_py() {
@@ -35,7 +35,7 @@ bump_patch() {
 
 set_version() {
   local ver="$1"
-  sed -i '' "s/^version:.*/version: $ver/" "$SKILL_MD"
+  sed -i '' "s/^  version:.*/  version: \"$ver\"/" "$SKILL_MD"
   sed -i '' "s/^__version__ = .*/__version__ = \"$ver\"/" "$RAW_PY"
 }
 

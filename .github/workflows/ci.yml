@@ -1,4 +1,4 @@
-# CI：PR 与 master 自动跑语法自检 + 全量单测
+# CI：所有分支推送及面向 master 的 PR 自动跑语法自检 + 全量单测
 # 仓库为 PUBLIC：Actions 标准 runner 免费，跑 Python 3.10（下限）+ 3.13 双档矩阵。
 # 测试全 mock（见 AGENTS.md），无需 Chrome/联网，ubuntu 单平台即可覆盖。
 # master 的停线由分支保护（required status check）强制，不依赖脚本门禁。
@@ -7,8 +7,7 @@ name: CI
 on:
   pull_request:
     branches: [master]
-  push:
-    branches: [master]
+  push: {}
 
 # 同一分支的新 run 取消同 ref 的旧 run
 concurrency:

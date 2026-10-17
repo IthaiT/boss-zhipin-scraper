@@ -866,10 +866,10 @@ class ChromeSetupTests(unittest.TestCase):
         self.assertEqual(mapped["skills"], "Python | Docker")
         self.assertEqual(mapped["welfare"], "五险一金 | 带薪年假")
 
-        # 缺薪资时 salary_source 标记 api_empty；「不限」不进 tags
+        # 缺薪资时 salary_source 标记 api_empty；原文中的「不限」保留。
         empty = module.map_api_job({"jobName": "X", "jobDegree": "不限"})
         self.assertEqual(empty["salary_source"], "api_empty")
-        self.assertEqual(empty["tags"], "")
+        self.assertEqual(empty["tags"], "不限")
 
     def test_map_api_jobs_skips_invalid_rows(self):
         module = load_module()
@@ -1338,7 +1338,7 @@ class ChromeSetupTests(unittest.TestCase):
                 "location": "上海",
                 "tags_list": "3-5年 | 本科",
                 "job_link": "https://www.zhipin.com/job_detail/abc.html",
-                "skill_tags": ["Python", "LLM"],
+                "skills": ["Python", "LLM"],
                 "jd": "Build AI agents",
             }])
 
@@ -1346,9 +1346,9 @@ class ChromeSetupTests(unittest.TestCase):
                 rows = list(csv.DictReader(f))
 
         self.assertEqual(rows[0]["job_id"], "abc123")
-        self.assertEqual(rows[0]["salary_source"], "api")
-        self.assertEqual(rows[0]["skill_tags"], "Python | LLM")
-        self.assertEqual(rows[0]["jd"], "Build AI agents")
+        self.assertNotIn("salary_source", rows[0])
+        self.assertEqual(json.loads(rows[0]["skills"]), ["Python", "LLM"])
+        self.assertEqual(rows[0]["job_description"], "Build AI agents")
 
     def test_scrape_details_final_save_handles_bare_filename(self):
         """--detail-output 传不带目录的裸文件名时，最终保存不应崩溃。
@@ -1369,7 +1369,7 @@ class ChromeSetupTests(unittest.TestCase):
             finally:
                 os.chdir(cwd)
 
-    def test_scrape_details_stops_before_writing_login_truncation(self):
+    def test_scrape_details_saves_login_page_before_stopping(self):
         module = load_module()
         session = mock.Mock()
 
@@ -1402,10 +1402,16 @@ class ChromeSetupTests(unittest.TestCase):
             output = paths["cdp_profile"] / "details.json"
             with mock.patch.object(module, "CDPSession", return_value=session), \
                     mock.patch.object(module.time, "sleep"):
-                with self.assertRaisesRegex(RuntimeError, "login expired"):
-                    module.scrape_details({"jobs": [job]}, output_path=str(output))
+                results = module.scrape_details({"jobs": [job, dict(job, job_id="next")]}, output_path=str(output))
+            saved = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(len(saved), 2)
+            self.assertEqual(saved[0]["capture_status"], "partial")
+            self.assertEqual(saved[0]["job_description"], "负责产品规划\n登录查看完整内容")
+            self.assertNotIn("page_text", saved[0])
+            self.assertEqual(saved[1]["capture_status"], "not_attempted")
+            self.assertEqual(saved[1]["capture_reason"], "login_required")
 
-        self.assertFalse(output.exists())
+        self.assertEqual(results[0]["capture_reason"], "login_required")
         session.send.assert_any_call(
             "Target.closeTarget", {"targetId": "target-1"}
         )
@@ -1757,6 +1763,265 @@ class ChromeSetupTests(unittest.TestCase):
         self.assertIn("--close-chrome", result.stdout)
 
 
+class RawExportTests(unittest.TestCase):
+    def make_session(self, module, extracted, navigation_error=None):
+        session = mock.Mock()
+
+        def send(method, params=None, sid=None):
+            if method == "Page.navigate" and navigation_error:
+                raise navigation_error
+            return {}
+
+        def evaluate(script, sid):
+            if script != module.EXTRACT_DETAIL_JS:
+                return None
+            if isinstance(extracted, BaseException):
+                raise extracted
+            return json.dumps(extracted, ensure_ascii=False)
+
+        session.send.side_effect = send
+        session.eval_js.side_effect = evaluate
+        return session
+
+    def job(self, job_id="one", link=True):
+        return {
+            "job_id": job_id,
+            "title": "嵌入式软件工程师",
+            "boss_name": "示例公司",
+            "job_link": f"https://www.zhipin.com/job_detail/{job_id}.html" if link else "",
+            "raw_list": {"customField": [None, "不限", {"text": "  原文\n"}]},
+        }
+
+    def run_export(self, module, jobs, sessions, output, **kwargs):
+        with mock.patch.object(module, "CDPSession", side_effect=sessions), \
+                mock.patch.object(module, "create_page_session", return_value=("target", "session")), \
+                mock.patch.object(module.time, "sleep"), \
+                mock.patch.object(module, "extract_detail_fields", side_effect=AssertionError("raw export must not clean text")):
+            return module.scrape_details(
+                {"keyword": "嵌入式", "city": "深圳", "jobs": jobs},
+                list_output_path=str(output), **kwargs,
+            )
+
+    def test_raw_api_item_preserves_unknown_fields_and_unlimited_tags(self):
+        module = load_module()
+        raw = {"jobName": "C工程师", "jobExperience": "不限", "jobDegree": "不限",
+               "unknown": {"value": None, "text": "  原文\r\n"}}
+        mapped = module.map_api_job(raw)
+        self.assertEqual(mapped["raw_list"], raw)
+        self.assertEqual(mapped["tags"], "不限 | 不限")
+
+    def test_json_and_csv_only_keep_selected_fields_and_preserve_long_description(self):
+        module = load_module()
+        description = "  " + "原" * 13000 + "\r\n  原始空格  \nC  "
+        page = "  页头\r\n\n职位描述\n" + description + "\nBOSS 安全提示\n  页尾  "
+        extracted = {"jd": "职位描述\n" + description, "page_text": page,
+                     "tags": ["C", "五险一金", "  标签  "], "url": "https://www.zhipin.com/job_detail/one.html",
+                     "extra": {"unknown": [None, 1]}}
+        session = self.make_session(module, extracted)
+        job = self.job()
+        job["raw_list"]["skills"] = ["C", "RTOS"]
+        with tempfile.TemporaryDirectory() as tmp:
+            output = pathlib.Path(tmp) / "jobs.json"
+            results = self.run_export(module, [job], [session], output)
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            with output.with_suffix(".csv").open(encoding="utf-8-sig", newline="") as f:
+                rows = list(csv.DictReader(f))
+        self.assertEqual(results[0]["capture_status"], "success")
+        self.assertEqual(payload["jobs"][0]["job_description"], description)
+        self.assertEqual(rows[0]["job_description"], description)
+        self.assertEqual(json.loads(rows[0]["skills"]), ["C", "RTOS"])
+        self.assertEqual(list(payload["jobs"][0]), module.EXPORT_COLUMNS)
+        self.assertEqual(list(rows[0]), module.EXPORT_COLUMNS)
+        for field in ("raw_list", "raw_detail", "page_text", "jd", "salary_source", "security_id"):
+            self.assertNotIn(field, payload["jobs"][0])
+            self.assertNotIn(field, rows[0])
+
+    def test_short_descriptions_are_saved_without_minimum_length(self):
+        module = load_module()
+        descriptions = ["C", "原" * 119, "原" * 120]
+        sessions = [self.make_session(module, {"jd": text, "page_text": text}) for text in descriptions]
+        with tempfile.TemporaryDirectory() as tmp:
+            results = self.run_export(module, [self.job(str(i)) for i in range(3)], sessions,
+                                      pathlib.Path(tmp) / "jobs.json")
+        self.assertEqual([r["jd"] for r in results], descriptions)
+        self.assertEqual([r["capture_status"] for r in results], ["success"] * 3)
+
+    def test_missing_link_and_navigation_failure_keep_rows_and_continue(self):
+        module = load_module()
+        bad = self.make_session(module, {}, navigation_error=TimeoutError("navigation timeout"))
+        good = self.make_session(module, {"jd": "原文", "page_text": "完整页面"})
+        with tempfile.TemporaryDirectory() as tmp:
+            results = self.run_export(module, [self.job("missing", False), self.job("bad"), self.job("good")],
+                                      [bad, good], pathlib.Path(tmp) / "jobs.json")
+        self.assertEqual([r["job_id"] for r in results], ["missing", "bad", "good"])
+        self.assertEqual([r["capture_status"] for r in results], ["failed", "failed", "success"])
+        self.assertEqual(results[0]["capture_reason"], "missing_job_link")
+        self.assertIn("navigation timeout", results[1]["capture_reason"])
+        bad.close.assert_called_once()
+        good.close.assert_called_once()
+
+    def test_description_not_found_still_saves_entire_page(self):
+        module = load_module()
+        extracted = {"jd": "", "page_text": "首页\n职位\n未知页面结构\n  全部保留  "}
+        session = self.make_session(module, extracted)
+        with tempfile.TemporaryDirectory() as tmp:
+            results = self.run_export(module, [self.job()], [session], pathlib.Path(tmp) / "jobs.json")
+        self.assertEqual(results[0]["capture_status"], "partial")
+        self.assertEqual(results[0]["page_text"], extracted["page_text"])
+
+    def test_limit_keeps_unattempted_rows_in_both_output_files(self):
+        module = load_module()
+        session = self.make_session(module, {"jd": "C", "page_text": "C"})
+        with tempfile.TemporaryDirectory() as tmp:
+            output = pathlib.Path(tmp) / "jobs.json"
+            results = self.run_export(module, [self.job("one"), self.job("two")], [session], output, max_details=1)
+            with output.with_suffix(".csv").open(encoding="utf-8-sig", newline="") as f:
+                rows = list(csv.DictReader(f))
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(results[1]["capture_status"], "not_attempted")
+        self.assertEqual(results[1]["capture_reason"], "max_details")
+
+    def test_security_page_is_saved_and_remaining_jobs_are_not_visited(self):
+        module = load_module()
+        extracted = {"jd": "", "page_text": "请完成安全验证", "url": "https://www.zhipin.com/web/common/security-check.html?_security_check=1"}
+        session = self.make_session(module, extracted)
+        with tempfile.TemporaryDirectory() as tmp:
+            results = self.run_export(module, [self.job("one"), self.job("two")], [session],
+                                      pathlib.Path(tmp) / "jobs.json")
+        self.assertEqual(results[0]["raw_detail"], extracted)
+        self.assertEqual(results[0]["capture_reason"], "security_check")
+        self.assertEqual(results[1]["capture_reason"], "security_check")
+
+    def test_interruption_preserves_success_and_unattempted_rows(self):
+        module = load_module()
+        sessions = [self.make_session(module, {"jd": "原文", "page_text": "全部"}),
+                    self.make_session(module, KeyboardInterrupt())]
+        with tempfile.TemporaryDirectory() as tmp:
+            output = pathlib.Path(tmp) / "jobs.json"
+            self.run_export(module, [self.job("one"), self.job("two")], sessions, output)
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            self.assertTrue(output.with_suffix(".csv").exists())
+        self.assertEqual(payload["jobs"][0]["capture_status"], "success")
+        self.assertEqual(payload["jobs"][1]["capture_reason"], "interrupted")
+
+    def test_main_default_exports_one_combined_pair_without_analysis(self):
+        module = load_module()
+        session = self.make_session(module, {"jd": " 职位描述\nC ", "page_text": " 原始页面 "})
+        with tempfile.TemporaryDirectory() as tmp:
+            source = pathlib.Path(tmp) / "input.json"
+            output = pathlib.Path(tmp) / "output.json"
+            source.write_text(json.dumps({"jobs": [self.job()]}), encoding="utf-8")
+            with mock.patch.object(sys, "argv", ["boss", "--input", str(source), "--output", str(output)]), \
+                    mock.patch.object(module, "require_runtime_dependencies", return_value=True), \
+                    mock.patch.object(module, "CDPSession", return_value=session), \
+                    mock.patch.object(module, "create_page_session", return_value=("target", "session")), \
+                    mock.patch.object(module.time, "sleep"), \
+                    mock.patch.object(module, "analyze") as analyze:
+                module.main()
+            saved = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(saved["jobs"][0]["job_description"], "C ")
+            self.assertEqual(list(saved["jobs"][0]), module.EXPORT_COLUMNS)
+            self.assertTrue(output.with_suffix(".csv").is_file())
+            self.assertEqual(sorted(p.name for p in pathlib.Path(tmp).iterdir()),
+                             ["input.json", "output.csv", "output.json"])
+            analyze.assert_not_called()
+
+
+class SelectedFieldExportTests(unittest.TestCase):
+    APPROVED = (
+        "city title company salary location experience_education_tags experience_requirement "
+        "education_requirement company_scale company_stage company_industry company_welfare "
+        "boss_title boss_active_status job_link job_description job_responsibilities job_requirements "
+        "skills work_address recruiter_name company_full_name company_link company_description "
+        "graduation_time application_deadline days_per_week minimum_months job_id captured_at "
+        "capture_status capture_reason"
+    ).split()
+
+    def test_projection_uses_exact_business_contract_and_is_idempotent(self):
+        module = load_module()
+        raw = {
+            "jobName": "嵌入式工程师", "cityName": "深圳", "brandName": "公司简称",
+            "bossName": "张先生", "bossTitle": "招聘经理", "salaryDesc": "20-30K·14薪",
+            "jobExperience": "不限", "jobDegree": "本科", "skills": ["C", " RTOS "],
+            "brandScaleName": "20-99人", "brandStageName": "未融资", "brandIndustry": "芯片",
+            "welfareList": ["五险一金", "带薪年假"], "daysPerWeekDesc": "5天/周", "leastMonthDesc": "3个月",
+            "securityId": "private-navigation-context", "unused": "不要写入",
+        }
+        job = dict(module.map_api_job(raw), job_id="one", page_text="unrelated", extra="discard")
+        projected = module.export_job_record(job)
+        self.assertEqual(list(projected), self.APPROVED)
+        self.assertEqual(len(projected), 32)
+        self.assertEqual(projected["company"], "公司简称")
+        self.assertEqual(projected["recruiter_name"], "张先生")
+        self.assertEqual(projected["skills"], ["C", " RTOS "])
+        self.assertEqual(projected["experience_education_tags"], "不限 | 本科")
+        self.assertEqual(projected["company_welfare"], "五险一金 | 带薪年假")
+        self.assertEqual(projected["days_per_week"], "5天/周")
+        self.assertEqual(projected["minimum_months"], "3个月")
+        self.assertEqual(module.export_job_record(projected), projected)
+        self.assertNotIn("private-navigation-context", json.dumps(projected))
+
+    def test_labelled_page_fields_are_copied_from_source(self):
+        module = load_module()
+        description = "C\r\n毕业时间：2027年 招聘截止日期：2027.07.31\r\n岗位职责：\r\n  1、编写 C  代码。\r\n  2、联调。\r\n任职要求：\r\n  熟悉 RTOS。\r\n职位福利：\r\n五险一金"
+        section = "微信扫码分享 举报\r\n职位描述\r\n" + description + "\r\n张先生\r\n3日内活跃\r\n公司简称\r\n·\r\n招聘经理"
+        page = section + "\r\n竞争力分析\r\nBOSS 安全提示\r\n安全声明\r\n公司介绍\r\n  公司做 芯片。\r\n\r\n第二段原文。\r\n查看全部\r\n工商信息\r\n公司名称\r\n公司工商全称有限公司\r\n工作地址\r\n深圳南山区示例大厦  801\r\n\r\n点击查看地图\r\n更多职位"
+        job = {"raw_detail": {"jd": section, "page_text": page}, "boss_active_status": "在线"}
+        projected = module.export_job_record(job)
+        self.assertEqual(projected["job_description"], description)
+        self.assertEqual(projected["job_responsibilities"], "  1、编写 C  代码。\r\n  2、联调。")
+        self.assertEqual(projected["job_requirements"], "  熟悉 RTOS。")
+        self.assertEqual(projected["boss_active_status"], "3日内活跃")
+        self.assertEqual(projected["company_description"], "  公司做 芯片。\r\n\r\n第二段原文。")
+        self.assertEqual(projected["company_full_name"], "公司工商全称有限公司")
+        self.assertEqual(projected["work_address"], "深圳南山区示例大厦  801")
+        self.assertEqual(projected["graduation_time"], "2027年")
+        self.assertEqual(projected["application_deadline"], "2027.07.31")
+        self.assertEqual(module.export_job_record(projected), projected)
+
+    def test_missing_or_unlabelled_sections_are_not_invented(self):
+        module = load_module()
+        description = "使用 C 开发，负责调试，需要熟悉硬件。"
+        projected = module.export_job_record({"jd": description})
+        self.assertEqual(projected["job_description"], description)
+        for field in ("job_responsibilities", "job_requirements", "work_address", "graduation_time", "application_deadline", "company_full_name"):
+            self.assertEqual(projected[field], "")
+        self.assertEqual(projected["skills"], [])
+        competitive = "岗位职责\n竞争力分析\n负责竞品研究\n任职要求\n有相关经验"
+        self.assertEqual(module.export_job_record({"jd": competitive})["job_description"], competitive)
+
+    def test_heading_variants_and_inline_sections_preserve_original_words(self):
+        module = load_module()
+        duties, requirements = module.split_job_sections(
+            "你的工作职责：\n1.编写驱动\n任职资格\n必须具备的：\n掌握 C\n可以加分的：\n熟悉 BLE\n福利待遇：\n双休"
+        )
+        self.assertEqual(duties, "1.编写驱动")
+        self.assertEqual(requirements, "必须具备的：\n掌握 C\n可以加分的：\n熟悉 BLE")
+        duties, requirements = module.split_job_sections("岗位职责：负责调试\n岗位要求：熟悉 C")
+        self.assertEqual(duties, "负责调试")
+        self.assertEqual(requirements, "熟悉 C")
+
+    def test_all_incremental_and_standalone_outputs_exclude_unapproved_fields(self):
+        module = load_module()
+        job = {"job_id": "one", "title": "C", "raw_list": {"securityId": "hidden"}, "page_text": "extra", "jd": "C"}
+        with tempfile.TemporaryDirectory() as tmp:
+            output = pathlib.Path(tmp) / "jobs.json"
+            module.flush_jobs(str(output), {"keyword": "C"}, [job])
+            saved = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(list(saved["jobs"][0]), self.APPROVED)
+            source = pathlib.Path(tmp) / "input.json"
+            source.write_text(json.dumps({"jobs": [job]}), encoding="utf-8")
+            with mock.patch.object(sys, "argv", ["boss", "--input", str(source), "--no-detail", "--output", str(output)]), \
+                    mock.patch.object(module, "require_runtime_dependencies", return_value=True):
+                module.main()
+            saved = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(list(saved["jobs"][0]), self.APPROVED)
+            with output.with_suffix(".csv").open(encoding="utf-8-sig", newline="") as f:
+                row = next(csv.DictReader(f))
+                self.assertEqual(list(row), self.APPROVED)
+            self.assertNotIn("hidden", output.read_text(encoding="utf-8"))
+
+
 class tempfile_profile:
     def __enter__(self):
         import tempfile
@@ -1907,7 +2172,7 @@ class VersionConsistencyTests(unittest.TestCase):
 
         # SKILL.md frontmatter: version: 2.0.0
         skill = self._read_text("SKILL.md")
-        m = re.search(r"^version:\s*([^\n]+)$", skill, re.MULTILINE)
+        m = re.search(r'^  version:\s*"?([^"\n]+)"?$', skill, re.MULTILINE)
         self.assertIsNotNone(m, "SKILL.md 未找到 version 字段")
         skill_ver = _normalize_version(m.group(1))
 

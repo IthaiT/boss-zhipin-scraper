@@ -4,13 +4,13 @@
 
 ## 这是什么
 
-`boss-zhipin-scraper` —— 通过 Chrome CDP（远程调试端口）连接**用户本人已登录的 Chrome**，抓取 BOSS直聘的公开职位数据（列表 + 详情），并可生成求职分析摘要。仅用于个人求职分析，非大规模爬虫（见 `CONTRIBUTING.md` 的合规一节）。
+`boss-zhipin-scraper` —— 通过 Chrome CDP（远程调试端口）连接**用户本人已登录的 Chrome**，抓取 BOSS直聘的公开职位数据（列表 + 详情），默认仅将用户确认的 32 个岗位字段导出为 JSON/CSV，文字字段直接摘取原文，不生成摘要。仅用于个人求职分析，非大规模爬虫（见 `CONTRIBUTING.md` 的合规一节）。
 
 ## 目录结构
 
 ```
 scripts/boss_cdp_raw.py   # 核心：抓取 + CLI 主入口（长单文件，行数以实际为准）
-scripts/job_summary.py    # 抓取结果 → Markdown 求职分析摘要
+scripts/job_summary.py    # 旧版手动分析兼容入口，不在抓取流程运行
 data/city_codes.json      # 全量城市码表（300+ 城市，外置；见下）
 tests/test_chrome_setup.py    # unittest，全 mock，不依赖真实 Chrome/网络
 tests/test_job_summary.py     # 摘要测试
@@ -58,3 +58,11 @@ SKILL.md / README(.en).md / CHANGELOG.md / CONTRIBUTING.md
 **先开 issue 再动手**：非平凡的改动（bug 修复、新功能、文档补充）按仓库 `CONTRIBUTING.md` 的规范，先在 Issues 开一条说明「改什么 / 为什么 / 怎么改」，讨论清楚后再起新分支提交。issue 正文要结构化（问题 / 现状 / 根因 / 建议 / 影响），并标注改动范围（哪些逻辑受影响、哪些不动）。
 
 **issue 分诊打标**：处理/关闭 issue 时按 `CONTRIBUTING.md` 的「Issue 标签约定」打标签；`wontfix` / `invalid` 关闭前必须留说明理由的回复。
+
+## 本地字段导出约定（2.5.0）
+
+- `EXPORT_COLUMNS` 是唯一的 32 字段白名单，所有 JSON/CSV 写入路径均通过 `export_job_record`；原始接口、页面文字、重复别名仅可临时用于采集，不落入交付文件。
+- 原文字段不做 AI 改写。职责、要求仅按明确标题截取，无法区分时留空；不依赖旧清洗器或 120 字符最低长度规则。
+- 技能来自列表 API；详情解析补齐活跃状态、地址、工商全称、公司介绍、毕业时间和招聘截止日期。
+- 所有岗位均保留；主输出是同名 JSON+CSV，`--detail-output` 额外副本也使用同一字段集。
+- `SKILL.md` 版本号在 `metadata.version`，遵循 skill frontmatter 校验要求。

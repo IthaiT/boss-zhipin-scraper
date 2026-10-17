@@ -48,3 +48,16 @@ Thumbs.db
 !AGENTS.md
 
 ./zcode
+
+# Local job captures and dedicated browser data
+job-result/
+job-results/
+chrome-profile/
+.boss-zhipin-scraper/
+jobs*.json
+jobs*.csv
+boss_jobs_*.json
+boss_jobs_*.csv
+boss_details_*.json
+boss_details_*.csv
+validation_*/

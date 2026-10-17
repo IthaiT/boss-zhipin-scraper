@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
+BOSS直聘职位原文抓取 — 纯 CDP raw protocol
 
 功能:
   1. 搜索特定职位 (关键词 + 城市)
   2. 筛选公司规模、融资阶段、薪资范围、经验、学历、行业
-  3. 抓取详情页 JD 并分析薪资范围和技能要求
-  4. 输出结构化 JSON + CSV + 终端分析报告
+  3. 直接摘取职位描述、职责要求、公司和招聘者信息的原文
+  4. 默认输出 JSON + CSV，仅保留用户确认的 32 个字段
   5. 环境检查、Chrome CDP 自动启动、登录状态检测
 
 用法:
@@ -19,7 +19,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.3.1"
+__version__ = "2.5.0"
 
 import json
 import time
@@ -622,7 +622,7 @@ def map_api_job(raw):
         ]),
         "tags": " | ".join(
             t for t in (raw.get("jobExperience") or "", raw.get("jobDegree") or "")
-            if t and t != "不限"
+            if t
         ),
         "boss_name": raw.get("brandName") or "",
         "boss_title": raw.get("bossTitle") or "",
@@ -646,6 +646,7 @@ def map_api_job(raw):
             if encrypt_brand_id else ""
         ),
         "welfare": " | ".join(raw.get("welfareList") or []),
+        "raw_list": raw,
     }
 
 
@@ -720,37 +721,20 @@ EXTRACT_DETAIL_JS = """
 (function(){
     var pageText = document.body ? document.body.innerText : '';
     var tags = [];
-    var benefitWords = ['五险','补充医疗','定期体检','带薪年假','年终奖','零食','餐补',
-        '节日福利','加班补助','股票期权','员工旅游','交通补助','通讯补贴','团建',
-        '生日福利','免费班车','全勤奖','包吃','弹性工作','下午茶','租房补贴',
-        '体检','健身','文化','充电假','司龄假','红包','能量补贴','社团','三薪',
-        '绩效','底薪','保底','活动基金','学习基金','节日礼品','无障碍'];
-    var noiseWords = ['BOSS直聘','boss','BOSS','来自BOSS直聘','金','金币'];
-    function isBenefit(t) {
-        if (t === '...' || t.length > 15 || t.length < 2) return true;
-        for (var i = 0; i < benefitWords.length; i++) {
-            if (t.includes(benefitWords[i])) return true;
-        }
-        for (var i = 0; i < noiseWords.length; i++) {
-            if (t === noiseWords[i] || t.includes(noiseWords[i])) return true;
-        }
-        return false;
-    }
     document.querySelectorAll('.job-tags .tag-all span, .job-keyword-list span').forEach(function(s){
-        var t = s.innerText.trim();
-        if(t && !isBenefit(t)) tags.push(t);
+        tags.push(s.innerText);
     });
     var jd = '';
     var sections = document.querySelectorAll('.job-detail-section, .job-sec');
     for (var i = 0; i < sections.length; i++) {
-        var text = (sections[i].innerText || '').trim();
+        var text = sections[i].innerText || '';
         if (text.indexOf('职位描述') !== -1 && text.length > jd.length) {
             jd = text;
         }
     }
     return JSON.stringify({
         jd: jd,
-        page_text: pageText.substring(0, 12000),
+        page_text: pageText,
         tags: tags,
         url: location.href
     });
@@ -1277,17 +1261,185 @@ def wait_for_login(cdp_port=DEFAULT_CDP_PORT, timeout=DEFAULT_LOGIN_TIMEOUT, int
 # ============================================================
 # CSV 导出
 # ============================================================
-CSV_COLUMNS = [
-    "job_id", "title", "salary", "salary_source", "location", "tags", "boss_name",
-    "boss_active_status",
-    "company_scale", "company_stage", "company_industry", "skills",
-    "job_link", "welfare", "is_new",
+EXPORT_COLUMNS = [
+    "city", "title", "company", "salary", "location",
+    "experience_education_tags", "experience_requirement", "education_requirement",
+    "company_scale", "company_stage", "company_industry", "company_welfare",
+    "boss_title", "boss_active_status", "job_link", "job_description",
+    "job_responsibilities", "job_requirements", "skills", "work_address",
+    "recruiter_name", "company_full_name", "company_link", "company_description",
+    "graduation_time", "application_deadline", "days_per_week", "minimum_months",
+    "job_id", "captured_at", "capture_status", "capture_reason",
 ]
+CSV_COLUMNS = EXPORT_COLUMNS
+DETAIL_CSV_COLUMNS = EXPORT_COLUMNS
 
-DETAIL_CSV_COLUMNS = [
-    "job_id", "title", "company", "salary", "salary_source", "location",
-    "boss_active_status", "tags_list", "job_link", "skill_tags", "jd",
-]
+
+def _source_text(value):
+    return value if isinstance(value, str) else ""
+
+
+def _page_region(page, heading, stop_headings, after=0):
+    """Slice a labelled page section without rewriting its paragraphs."""
+    start = re.search(rf"(?m)^{re.escape(heading)}[：:]?[ \t]*\r?$", page[after:])
+    if start is None:
+        return ""
+    begin = after + start.end()
+    if page.startswith("\r\n", begin):
+        begin += 2
+    elif page.startswith("\n", begin):
+        begin += 1
+    stops = "|".join(re.escape(label) for label in stop_headings)
+    end = re.search(rf"(?m)^(?:{stops})[：:]?[ \t]*\r?$", page[begin:])
+    finish = begin + end.start() if end is not None else len(page)
+    return page[begin:finish].strip("\r\n")
+
+
+def _page_value(page, label):
+    match = re.search(rf"(?m)^{re.escape(label)}[：:]?[ \t]*\r?\n([^\r\n]+)", page)
+    return match.group(1) if match else ""
+
+
+def _description_body(text):
+    """Select description text; retain its original spaces and line breaks."""
+    lines = text.splitlines(keepends=True)
+    footer_start, _status = _recruiter_footer_info(lines)
+    finish = footer_start if footer_start is not None else len(lines)
+    if footer_start is None:
+        for index, line in enumerate(lines):
+            if line.strip() == DETAIL_SAFETY_MARKER:
+                finish = index
+                break
+    begin = 0
+    for index, line in enumerate(lines[:finish]):
+        if line.strip() in ("职位描述", "职位描述：", "职位描述:"):
+            begin = index + 1
+            break
+    return "".join(lines[begin:finish]).strip("\r\n")
+
+
+def split_job_sections(description):
+    """Copy explicitly headed responsibilities/requirements; never infer them."""
+    responsibility = {
+        "岗位职责", "工作职责", "你的工作职责", "主要职责", "职位职责",
+        "职责描述", "工作内容", "主要工作内容", "岗位工作内容",
+    }
+    requirement = {
+        "任职要求", "岗位要求", "任职资格", "职位要求", "任职条件",
+        "任职资格要求", "资格要求", "招聘要求", "应聘条件", "你需要具备",
+    }
+    boundary = {"公司介绍", "团队介绍", "福利待遇", "职位福利", "薪资福利", "我们将为您提供以下福利"}
+    headings = responsibility | requirement | boundary | {"职位描述"}
+    alternatives = "|".join(re.escape(h) for h in sorted(headings, key=len, reverse=True))
+    pattern = re.compile(
+        rf"(?m)^[ \t]*(?:[一二三四五六七八九十\d]+[、.．)）][ \t]*)?"
+        rf"(?P<heading>{alternatives})(?:[ \t]*[：:][ \t]*|[ \t]*(?=\r?$))"
+    )
+    matches = list(pattern.finditer(description))
+    duties, requirements = [], []
+    for index, match in enumerate(matches):
+        heading = match.group("heading")
+        begin = match.end()
+        if description.startswith("\r\n", begin):
+            begin += 2
+        elif description.startswith("\n", begin):
+            begin += 1
+        finish = matches[index + 1].start() if index + 1 < len(matches) else len(description)
+        body = description[begin:finish].strip("\r\n")
+        if heading in requirement:
+            requirements.append(body)
+        elif heading in responsibility or (
+            heading == "职位描述" and any(m.group("heading") in requirement for m in matches[index + 1:])
+        ):
+            duties.append(body)
+    return "\n\n".join(duties), "\n\n".join(requirements)
+
+
+def selected_detail_fields(job):
+    """Extract approved fields from temporary page data or legacy captures."""
+    extracted = job.get("raw_detail")
+    extracted = extracted if isinstance(extracted, dict) else {}
+    page = _source_text(extracted.get("page_text", job.get("page_text", "")))
+    section = _source_text(extracted.get("jd", job.get("jd", "")))
+    if not section and DETAIL_DESCRIPTION_MARKER in page:
+        section = page
+    description = _source_text(extracted.get("job_description"))
+    if not description:
+        description = _description_body(section) if section else _source_text(job.get("job_description"))
+    duties, requirements = split_job_sections(description)
+    _footer, activity = _recruiter_footer_info(section.splitlines())
+    if not activity and page:
+        _footer, activity = _recruiter_footer_info(page.splitlines())
+    safety = page.find(DETAIL_SAFETY_MARKER)
+    company_after = safety if safety >= 0 else 0
+    company_description = _page_region(
+        page, "公司介绍", ("查看全部", "工商信息", "工作地址", "更多职位"), after=company_after
+    )
+    graduation = re.search(r"毕业时间[：:][ \t]*([^\r\n]*?)(?=[ \t]*招聘截止日期[：:]|\r?$)", page, re.MULTILINE)
+    deadline = re.search(r"招聘截止日期[：:][ \t]*([^\r\n]+)", page)
+    return {
+        "job_description": description,
+        "job_responsibilities": _source_text(extracted.get("job_responsibilities")) or duties or _source_text(job.get("job_responsibilities")),
+        "job_requirements": _source_text(extracted.get("job_requirements")) or requirements or _source_text(job.get("job_requirements")),
+        "boss_active_status": _source_text(extracted.get("boss_active_status")) or activity or _source_text(job.get("boss_active_status")),
+        "work_address": _source_text(extracted.get("work_address")) or _page_region(page, "工作地址", ("点击查看地图", "更多职位", "看过该职位的人还看了")) or _source_text(job.get("work_address")),
+        "company_full_name": _source_text(extracted.get("company_full_name")) or _page_value(page, "公司名称") or _source_text(job.get("company_full_name")),
+        "company_description": _source_text(extracted.get("company_description")) or company_description or _source_text(job.get("company_description")),
+        "graduation_time": graduation.group(1) if graduation else _source_text(job.get("graduation_time")),
+        "application_deadline": deadline.group(1) if deadline else _source_text(job.get("application_deadline")),
+    }
+
+
+def export_job_record(job):
+    """Project a job to exactly the 32 user-approved fields in both formats."""
+    raw = job.get("raw_list")
+    raw = raw if isinstance(raw, dict) else {}
+    result = {field: job.get(field, "") for field in EXPORT_COLUMNS}
+    experience = raw.get("jobExperience") or job.get("experience_requirement") or ""
+    degree = raw.get("jobDegree") or job.get("education_requirement") or ""
+    legacy_tags = job.get("tags_list") or job.get("tags") or ""
+    for tag in legacy_tags.split(" | ") if isinstance(legacy_tags, str) else []:
+        if not degree and tag in ("初中及以下", "中专/中技", "高中", "大专", "本科", "硕士", "博士", "学历不限"):
+            degree = tag
+        elif not experience and ("年" in tag or "应届" in tag or "在校" in tag or "经验" in tag):
+            experience = tag
+    skills = raw.get("skills", job.get("skills", []))
+    if isinstance(skills, str):
+        skills = skills.split(" | ") if skills else []
+    if not isinstance(skills, list):
+        skills = []
+    welfare = raw.get("welfareList", job.get("company_welfare", job.get("welfare", "")))
+    if isinstance(welfare, list):
+        welfare = " | ".join(welfare)
+    if welfare is None:
+        welfare = ""
+    result.update({
+        "city": raw.get("cityName") or job.get("city") or _source_text(job.get("location")).split("·")[0],
+        "title": raw.get("jobName") or job.get("title", ""),
+        "company": raw.get("brandName") or job.get("company") or job.get("boss_name", ""),
+        "salary": raw.get("salaryDesc") or job.get("salary", ""),
+        "experience_requirement": experience,
+        "education_requirement": degree,
+        "experience_education_tags": job.get("experience_education_tags") or " | ".join(v for v in (experience, degree) if v),
+        "company_scale": raw.get("brandScaleName") or job.get("company_scale", ""),
+        "company_stage": raw.get("brandStageName") or job.get("company_stage", ""),
+        "company_industry": raw.get("brandIndustry") or job.get("company_industry", ""),
+        "company_welfare": welfare,
+        "boss_title": raw.get("bossTitle") or job.get("boss_title", ""),
+        "recruiter_name": raw.get("bossName") or job.get("recruiter_name", ""),
+        "skills": skills,
+        "days_per_week": raw.get("daysPerWeekDesc") or job.get("days_per_week", ""),
+        "minimum_months": raw.get("leastMonthDesc") or job.get("minimum_months", ""),
+    })
+    result.update(selected_detail_fields(job))
+    return result
+
+
+def csv_value(value):
+    """Keep nested source data as JSON and leave all text/newlines unchanged."""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return value
 
 
 def write_csv(csv_path, jobs):
@@ -1298,7 +1450,8 @@ def write_csv(csv_path, jobs):
         writer.writeheader()
         for j in jobs:
             # 确保每列都有值
-            row = {col: j.get(col, "") for col in CSV_COLUMNS}
+            exported = export_job_record(j)
+            row = {col: csv_value(exported[col]) for col in CSV_COLUMNS}
             writer.writerow(row)
     print(f"CSV 已保存: {csv_path}")
 
@@ -1310,9 +1463,8 @@ def write_detail_csv(csv_path, details):
         writer = csv.DictWriter(f, fieldnames=DETAIL_CSV_COLUMNS, extrasaction="ignore")
         writer.writeheader()
         for d in details:
-            row = {col: d.get(col, "") for col in DETAIL_CSV_COLUMNS}
-            if isinstance(row.get("skill_tags"), list):
-                row["skill_tags"] = " | ".join(row["skill_tags"])
+            exported = export_job_record(d)
+            row = {col: csv_value(exported[col]) for col in DETAIL_CSV_COLUMNS}
             writer.writerow(row)
     print(f"详情 CSV 已保存: {csv_path}")
 
@@ -1382,7 +1534,7 @@ def flush_jobs(path, meta, jobs):
             pass
     merged = merge_unique(existing_jobs, jobs)
     meta["total"] = len(merged)
-    meta["jobs"] = merged
+    meta["jobs"] = [export_job_record(job) for job in merged]
     _atomic_write_json(path, meta)
 
 
@@ -1782,7 +1934,9 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
             new = 0
             new_count = 0
             for j in jobs:
-                key = j.get('job_link') or j['title']
+                key = j.get('job_link') or json.dumps(
+                    j.get('raw_list', j), ensure_ascii=False, sort_keys=True
+                )
                 j['job_id'] = hashlib.md5(key.encode()).hexdigest()[:16]
                 if key in seen:
                     continue
@@ -1863,15 +2017,17 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
 # 抓取详情
 # ============================================================
 def build_detail_record(job, extracted):
+    """Attach unmodified captured text to the complete listing record."""
     link = job.get("job_link", "")
     boss_active_status = resolve_boss_active_status(
         list_status=job.get("boss_active_status", ""),
         detail_status=extracted.get("boss_active_status", ""),
     )
-    return {
+    record = dict(job)
+    record.update({
         "job_id": job.get("job_id", ""),
         "title": job.get("title", ""),
-        "company": job.get("boss_name", ""),
+        "company": job.get("company") or job.get("boss_name", ""),
         "salary": job.get("salary", ""),
         "salary_source": job.get("salary_source", ""),
         "location": job.get("location", ""),
@@ -1881,126 +2037,131 @@ def build_detail_record(job, extracted):
         "link": link,
         "skill_tags": extracted.get("tags", []),
         "jd": extracted.get("jd", ""),
-    }
+        "page_text": extracted.get("page_text", ""),
+        "detail_url": extracted.get("url", ""),
+        "raw_detail": extracted,
+        "captured_at": datetime.now().astimezone().isoformat(),
+        "capture_status": "pending",
+        "capture_reason": "",
+    })
+    return record
 
 
 def scrape_details(list_data, max_details=None, output_path=None,
-                   cdp_port=DEFAULT_CDP_PORT, fmt="json"):
+                   cdp_port=DEFAULT_CDP_PORT, fmt="csv", list_output_path=None):
+    """Save every listing, full page text, and failures without cleaning a JD."""
     jobs = list_data.get("jobs", [])
-    if max_details:
-        jobs = jobs[:max_details]
-    if not output_path:
+    if max_details is not None and max_details < 0:
+        raise ValueError("max_details must be non-negative")
+    if not output_path and not list_output_path:
         output_path = default_output_path("details")
 
     print(f"\n=== 抓取岗位详情 ({len(jobs)} 个) ===\n")
-    results = []
-    seen_links = set()
+    results = [build_detail_record(job, {}) for job in jobs]
+    for idx, record in enumerate(results):
+        record["capture_status"] = "not_attempted"
+        record["capture_reason"] = (
+            "max_details" if max_details is not None and idx >= max_details else "pending"
+        )
 
-    for idx, job in enumerate(jobs):
-        link = job.get("job_link", "")
-        title = job.get("title", "")
-        company = job.get("boss_name", "")
-        if not link:
-            continue
-
-        # 按 link 去重
-        if link in seen_links:
-            print(f"[{idx+1}/{len(jobs)}] 跳过重复: {company} - {title}")
-            continue
-        seen_links.add(link)
-
-        t0 = time.time()
-        print(f"[{idx+1}/{len(jobs)}] {company} - {title}")
-
-        incr_request()
-
-        # 每个详情页用新 session 避免检测；自动化 target 默认后台创建。
-        ws = CDPSession(cdp_port)
-        tid, sid = create_page_session(ws)
-
-        detail_url = build_detail_url(job)
-        ws.send("Page.navigate", {"url": detail_url}, sid)
-        print(f"  加载页面...")
-        time.sleep(random.uniform(5, 10))
-
-        # 模拟人类阅读详情页的滚动行为
-        scroll_count = random.randint(3, 7)
-        print(f"  模拟滚动 ({scroll_count} 次)...")
-        for i in range(scroll_count):
-            if random.random() < 0.12:
-                # 偶尔往上回滚（回看内容）
-                delta = -random.randint(80, 200)
-            else:
-                delta = random.randint(200, 600)
-            ws.eval_js(f"window.scrollBy(0,{delta})", sid)
-            # 有时快滚，有时停下来"阅读"
-            if random.random() < 0.35:
-                time.sleep(random.uniform(2.0, 5.0))
-            else:
-                time.sleep(random.uniform(0.8, 1.8))
-
-        # 偶尔模拟鼠标移动
-        if random.random() < 0.5:
-            ws.send("Input.dispatchMouseEvent", {
-                "type": "mouseMoved",
-                "x": random.randint(200, 800),
-                "y": random.randint(200, 600)
-            }, sid)
-            time.sleep(random.uniform(0.5, 1.5))
-
-        print(f"  提取 JD...")
-        val = ws.eval_js(EXTRACT_DETAIL_JS, sid)
-        try:
-            d = json.loads(val) if isinstance(val, str) else {"jd": "", "tags": []}
-        except (json.JSONDecodeError, ValueError, TypeError):
-            d = {"jd": "", "tags": []}
-
-        try:
-            fields = extract_detail_fields(d)
-            d["jd"] = fields["jd"]
-            d["boss_active_status"] = resolve_boss_active_status(
-                list_status=job.get("boss_active_status", ""),
-                detail_status=fields["boss_active_status"],
-            )
-        except DetailLoginRequiredError as exc:
-            ws.send("Target.closeTarget", {"targetId": tid})
-            ws.close()
-            raise RuntimeError(
-                "BOSS detail login expired; stopped before writing truncated JD data"
-            ) from exc
-        except DetailExtractionError as exc:
-            print(f"  跳过无效详情页: {exc}")
-            ws.send("Target.closeTarget", {"targetId": tid})
-            ws.close()
-            continue
-
-        detail = build_detail_record(job, d)
-        results.append(detail)
-
-        if d.get("tags"):
-            print(f"  技能: {', '.join(d['tags'])}")
-        if d.get("boss_active_status"):
-            print(f"  活跃: {d['boss_active_status']}")
-        print(f"  JD: {len(d.get('jd',''))} 字 ({time.time()-t0:.0f}s)")
-
-        # 每抓完一个详情就写入，异常退出也能保留
+    def save(export_csv=False):
+        exported = [export_job_record(job) for job in results]
         if output_path:
-            _atomic_write_json(output_path, results)
+            _atomic_write_json(output_path, exported)
+            if export_csv and fmt == "csv":
+                write_detail_csv(output_path.rsplit(".", 1)[0] + ".csv", results)
+        if list_output_path:
+            payload = dict(list_data, total=len(results), jobs=exported)
+            _atomic_write_json(list_output_path, payload)
+            if export_csv and fmt == "csv":
+                write_csv(list_output_path.rsplit(".", 1)[0] + ".csv", results)
 
-        ws.send("Target.closeTarget", {"targetId": tid})
-        ws.close()
-        # 详情页间隔加大，随机 10-25 秒
-        gap = random.uniform(10, 25)
-        print(f"  等待 {gap:.0f}s 后抓下一个...\n")
-        time.sleep(gap)
+    save()
+    try:
+        for idx, job in enumerate(jobs):
+            record = results[idx]
+            if record["capture_reason"] == "max_details":
+                continue
+            if not job.get("job_link"):
+                record.update(capture_status="failed", capture_reason="missing_job_link")
+                save()
+                continue
 
-    # 最终保存（dirname 为空时回退到当前目录，与循环内/其它写文件处保持一致）
-    _atomic_write_json(output_path, results)
-    print(f"\n详情已保存: {output_path}")
+            print(f"[{idx+1}/{len(jobs)}] {job.get('boss_name', '')} - {job.get('title', '')}")
+            ws = None
+            tid = None
+            stop_reason = ""
+            try:
+                incr_request()
+                ws = CDPSession(cdp_port)
+                tid, sid = create_page_session(ws)
+                ws.send("Page.navigate", {"url": build_detail_url(job)}, sid)
+                time.sleep(random.uniform(5, 10))
+                for _ in range(random.randint(3, 7)):
+                    ws.eval_js(f"window.scrollBy(0,{random.randint(200, 600)})", sid)
+                    time.sleep(random.uniform(0.8, 2.0))
 
-    if fmt == "csv":
-        csv_path = output_path.rsplit(".", 1)[0] + ".csv"
-        write_detail_csv(csv_path, results)
+                val = ws.eval_js(EXTRACT_DETAIL_JS, sid)
+                try:
+                    extracted = json.loads(val) if isinstance(val, str) else val
+                except (json.JSONDecodeError, ValueError, TypeError):
+                    extracted = {"extractor_response": val}
+                if not isinstance(extracted, dict):
+                    extracted = {"extractor_response": extracted}
+                record = build_detail_record(job, extracted)
+                results[idx] = record
+                page_text = record["page_text"]
+                jd = record["jd"]
+                if not isinstance(page_text, str) or not isinstance(jd, str):
+                    record.update(capture_status="failed", capture_reason="invalid_extractor_response")
+                elif DETAIL_LOGIN_MARKER in page_text or DETAIL_LOGIN_MARKER in jd:
+                    record.update(capture_status="partial", capture_reason="login_required")
+                    stop_reason = "login_required"
+                elif "_security_check" in str(extracted.get("url", "")):
+                    record.update(capture_status="partial", capture_reason="security_check")
+                    stop_reason = "security_check"
+                elif jd.strip():
+                    record.update(capture_status="success", capture_reason="")
+                elif page_text.strip():
+                    record.update(capture_status="partial", capture_reason="description_not_found")
+                else:
+                    record.update(capture_status="failed", capture_reason="empty_page_or_extraction_failed")
+                print(f"  {record['capture_status']}: 原始页面 {len(page_text) if isinstance(page_text, str) else 0} 字符")
+            except CDP_TRANSIENT_EXCEPTIONS + (OSError, RuntimeError, ValueError, TypeError, KeyError) as exc:
+                record.update(capture_status="failed", capture_reason=f"{type(exc).__name__}: {exc}")
+                print(f"  已保留失败记录: {exc}")
+            finally:
+                # Persist even on interruption, before attempting browser cleanup.
+                save()
+                if ws is not None:
+                    try:
+                        if tid is not None:
+                            ws.send("Target.closeTarget", {"targetId": tid})
+                    except CDP_TRANSIENT_EXCEPTIONS + (OSError, RuntimeError) as exc:
+                        log.warning(f"详情标签页关闭失败: {exc}")
+                    finally:
+                        try:
+                            ws.close()
+                        except CDP_TRANSIENT_EXCEPTIONS + (OSError, RuntimeError) as exc:
+                            log.warning(f"详情连接关闭失败: {exc}")
+
+            if stop_reason:
+                for remaining in results[idx+1:]:
+                    if remaining["capture_reason"] == "pending":
+                        remaining["capture_reason"] = stop_reason
+                print(f"需要人工处理 {stop_reason}；原文和未处理岗位均已保存。")
+                break
+            if idx + 1 < len(jobs):
+                time.sleep(random.uniform(10, 25))
+    except KeyboardInterrupt:
+        for record in results:
+            if record["capture_reason"] == "pending":
+                record["capture_reason"] = "interrupted"
+        print("\n抓取中断，已保存原文和未处理岗位。")
+    finally:
+        save(export_csv=True)
+
+    list_data["jobs"] = results
     return results
 
 
@@ -2756,11 +2917,11 @@ def main():
     p.add_argument("--pages", type=int, default=3, help=f"抓取页数 (最大 {MAX_PAGES})")
     p.add_argument("--output", default=None, help="列表数据输出路径")
     p.add_argument("--diff-base", default=None, help="is_new 对比基准文件(默认自动取同关键词同城市、日期早于本轮的最近一份结果)")
-    p.add_argument("--detail-output", default=None, help="详情数据输出路径")
+    p.add_argument("--detail-output", default=None, help="可选：额外保存独立详情文件（默认详情直接写入 --output）")
     p.add_argument("--cdp-port", type=int, default=DEFAULT_CDP_PORT,
                    help=f"CDP 调试端口 (默认 {DEFAULT_CDP_PORT})")
-    p.add_argument("--format", default="json", choices=["json", "csv"],
-                   help="输出格式 (默认 json)")
+    p.add_argument("--format", default="csv", choices=["json", "csv"],
+                   help="默认 csv：同时保存 JSON 和 CSV；json：只保存 JSON")
     p.add_argument("--merge", default=None,
                    help="合并已有 JSON 文件 (按 job_id 去重)")
 
@@ -2813,6 +2974,10 @@ def main():
                    help="抓取正常结束后自动关闭专用 Chrome（默认不关；异常退出不触发，保留登录态）")
 
     args = p.parse_args()
+    if args.pages < 1:
+        p.error("--pages 必须大于零")
+    if args.max_details is not None and args.max_details < 0:
+        p.error("--max-details 不能为负数")
 
     # --check 模式
     if args.check:
@@ -2871,6 +3036,10 @@ def main():
         if val:
             filters[key] = val
 
+    # One output pair contains both the original listing and raw detail text.
+    if args.output is None:
+        args.output = default_output_path("jobs")
+
     # 加载或抓取列表
     if args.input:
         with open(args.input, encoding="utf-8") as f:
@@ -2919,15 +3088,27 @@ def main():
         details = scrape_details(
             list_data, args.max_details, args.detail_output,
             cdp_port=args.cdp_port, fmt=args.format,
+            list_output_path=args.output,
         )
         # 若处于合并流程，把旧详情并入本次抓取结果并重新落盘，保证 --merge 后详情不丢失
         if merged_details and args.detail_output:
             details = merge_details_from_lists(merged_details, details)
-            _atomic_write_json(args.detail_output, details)
+            _atomic_write_json(args.detail_output, [export_job_record(job) for job in details])
             print(f"合并详情已保存: {args.detail_output}")
             if args.format == "csv":
                 detail_csv = args.detail_output.rsplit(".", 1)[0] + ".csv"
                 write_detail_csv(detail_csv, details)
+
+    else:
+        for job in list_data.get("jobs", []):
+            job.setdefault("capture_status", "not_attempted")
+            job.setdefault("capture_reason", "no_detail")
+        payload = dict(list_data, jobs=[export_job_record(job) for job in list_data.get("jobs", [])])
+        _atomic_write_json(args.output, payload)
+        if args.format == "csv":
+            write_csv(args.output.rsplit(".", 1)[0] + ".csv", list_data.get("jobs", []))
+
+    print(f"原始数据已保存: {args.output}")
 
     # 分析
     if args.analysis:

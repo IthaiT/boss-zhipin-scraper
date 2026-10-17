@@ -277,7 +277,7 @@ class JobSummaryTests(unittest.TestCase):
         for document in (readme, changelog, skill):
             self.assertIn("job_summary.py", document)
             self.assertIn("提示词", document)
-        self.assertIn("cp boss-zhipin-scraper/scripts/job_summary.py", skill)
+        self.assertTrue((ROOT_PATH / "scripts" / "job_summary.py").is_file())
         self.assertIn('boss-summary = "scripts.job_summary:main"', pyproject)
 
 
