@@ -1,11 +1,11 @@
 # BOSS直聘职位字段导出工具 v2.5.0
 
-> 本分支是 [IthaiT/boss-zhipin-scraper](https://github.com/IthaiT/boss-zhipin-scraper) 的个人定制版，基于 [eatmoreduck/boss-zhipin-scraper](https://github.com/eatmoreduck/boss-zhipin-scraper)。`2.5.0` 是本定制分支的版本号，不代表上游官方发布。原项目作者与 MIT 许可证保持不变。
+> 本仓库是 [IthaiT/boss-zhipin-scraper](https://github.com/IthaiT/boss-zhipin-scraper) 的个人定制版，基于 [eatmoreduck/boss-zhipin-scraper](https://github.com/eatmoreduck/boss-zhipin-scraper)。`2.5.0` 是本定制版的版本号，不代表上游官方发布。原项目作者与 MIT 许可证保持不变。
 
-使用这份定制代码时，克隆对应分支：
+直接克隆本仓库，默认 `master` 分支即为定制版：
 
 ```bash
-git clone --branch feat/selected-fields-export https://github.com/IthaiT/boss-zhipin-scraper.git
+git clone https://github.com/IthaiT/boss-zhipin-scraper.git
 cd boss-zhipin-scraper
 ```
 

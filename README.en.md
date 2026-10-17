@@ -1,11 +1,11 @@
 # BOSS Zhipin Selected Field Export v2.5.0
 
-> This is IthaiT's personal fork of [eatmoreduck/boss-zhipin-scraper](https://github.com/eatmoreduck/boss-zhipin-scraper). Version `2.5.0` identifies this custom branch, not an official upstream release. Original authorship and the MIT license are retained.
+> This is IthaiT's personal fork of [eatmoreduck/boss-zhipin-scraper](https://github.com/eatmoreduck/boss-zhipin-scraper). Version `2.5.0` identifies this custom fork, not an official upstream release. Original authorship and the MIT license are retained.
 
-Clone the custom branch to use this version:
+Clone this repository; its default `master` branch contains the custom version:
 
 ```bash
-git clone --branch feat/selected-fields-export https://github.com/IthaiT/boss-zhipin-scraper.git
+git clone https://github.com/IthaiT/boss-zhipin-scraper.git
 cd boss-zhipin-scraper
 ```
 
