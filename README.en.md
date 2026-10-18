@@ -17,7 +17,7 @@ Export only the 32 user-approved job fields to JSON and CSV. Descriptions, respo
 python scripts/boss_cdp_raw.py --check
 # Only when CDP is unavailable; use --setup-edge for Edge
 python scripts/boss_cdp_raw.py --setup-chrome
-python scripts/boss_cdp_raw.py --keyword "嵌入式软件工程师" --city 深圳 --pages 3 --output jobs.json
+python scripts/boss_cdp_raw.py --keyword "嵌入式软件工程师" --city 深圳 --output jobs.json
 ```
 
 Python 3.10+, `requests`, and `websocket-client` are required. The default output is `jobs.json` plus `jobs.csv`, with the same 32 fields per job. JSON retains keyword, city, total, and a `jobs` array at the top level. `--format json` writes JSON only; `--detail-output` is an optional extra copy with the same fields.
@@ -47,7 +47,14 @@ CSV snapshots are written completely before atomic replacement, so readers see a
 
 The dedicated persistent profile is `~/.boss-zhipin-scraper/chrome-profile`; main-browser data is not copied by default. Use `--copy-login-state` only when explicitly requested. `--reset-chrome-profile` clears the dedicated login; `--stop-chrome` / `--stop-edge` close only the dedicated profile. Default result directory: `~/.boss-zhipin-scraper/job-result/`.
 
-At most 10 batches per run, with existing request intervals. Manual verification and login walls stop further visits after saving approved fields and remaining-job statuses. `--no-detail` exports listings only; an explicit `--max-details N` retains excess jobs as unattempted.
+There is no default fixed page or total-request cap; existing request intervals remain. After each page, either condition stops the current city:
+
+- At least **8 jobs** have recruiter activity older than seven days.
+- At least **8 jobs** have a `job_id` seen on earlier pages in this city during the current run. Count before deduplication; export unique jobs, and do not count same-page repetitions as historical duplicates.
+
+The threshold stays at 8 regardless of page length. All new jobs on the triggering page are processed and saved. Prefer detail activity and reuse captured results for duplicates. Labels such as “8天前活跃”, “30日内活跃”, and “本月活跃” count; “在线” and “7日内活跃” do not. Missing or ambiguous labels such as “近期活跃” do not count. With `--no-detail` or an explicit detail limit, use only activity already available.
+
+An explicit `--pages N` sets an optional page cap, including values above 10; omit it for automatic stopping. End of results, empty pages, capture timeouts, verification, login walls, connection errors, and interruption also save progress and stop. JSON metadata includes `pages_completed`, `stop_reason`, and `last_page`. `--no-detail` exports listings only; an explicit `--max-details N` retains excess jobs as unattempted.
 
 ```bash
 python -m unittest tests.test_chrome_setup tests.test_job_summary

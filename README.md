@@ -17,7 +17,7 @@ cd boss-zhipin-scraper
 python scripts/boss_cdp_raw.py --check
 # 仅在 CDP 不通时启动；Edge 使用 --setup-edge
 python scripts/boss_cdp_raw.py --setup-chrome
-python scripts/boss_cdp_raw.py --keyword "嵌入式软件工程师" --city 深圳 --pages 3 --output jobs.json
+python scripts/boss_cdp_raw.py --keyword "嵌入式软件工程师" --city 深圳 --output jobs.json
 ```
 
 需要 Python 3.10+、`requests`、`websocket-client`。默认生成 `jobs.json` 和 `jobs.csv`，每条岗位的字段相同且仅有 32 个。JSON 顶层保留关键词、城市、总数和 `jobs` 数组。`--format json` 仅保存 JSON；`--detail-output` 是可选的同字段详情副本。
@@ -47,7 +47,14 @@ CSV 先写完整快照，再原子替换，读取时不会看到半截文件；�
 
 专用持久 profile 位于 `~/.boss-zhipin-scraper/chrome-profile`，默认不复制主浏览器数据。仅用户明确要求时使用 `--copy-login-state`；`--reset-chrome-profile` 清除专用登录态，`--stop-chrome` / `--stop-edge` 仅关闭专用 profile。默认结果目录为 `~/.boss-zhipin-scraper/job-result/`。
 
-单次最多 10 批，保留请求间隔。人工验证和登录墙出现时，保存选定字段及剩余任务状态后停止。`--no-detail` 只取列表；显式 `--max-details N` 的超出部分仍在文件中标记未处理。
+默认不设固定页数或请求总量上限，保留原有请求间隔。每完成一页，以下任一条件满足就停止当前城市：
+
+- 本页至少 **8 条**岗位的招聘者活跃状态超过 7 天。
+- 本页至少 **8 条**岗位的 `job_id` 已在本次当前城市的前面页面出现。统计发生在去重前，导出只保留唯一岗位，同页内部重复不会冒充历史重复。
+
+阈值固定为 8 条，不按实际页长重新折算；触发停止的这一页仍处理、保存所有新岗位。活跃状态优先取详情并复用已抓岗位结果；例如“8天前活跃”“30日内活跃”“本月活跃”计入，“在线”“7日内活跃”不计入；缺失、“近期活跃”等不明确状态也不计入。`--no-detail` 或详情被显式限制时，仅用已取得的状态判断。
+
+可显式传 `--pages N` 设置页数上限（允许超过 10）；未传时自动停止。网站无更多结果、空页、捕获超时、人工验证、登录墙、连接异常或人工中断也会保存后停止；JSON 顶层记录 `pages_completed`、`stop_reason`、`last_page` 以便查看原因。`--no-detail` 只取列表；显式 `--max-details N` 的超出部分仍在文件中标记未处理。
 
 ```bash
 python -m unittest tests.test_chrome_setup tests.test_job_summary

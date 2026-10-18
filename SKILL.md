@@ -49,7 +49,7 @@ PYTHON SCRIPT_PATH --check --cdp-port 9222
 只有 CDP 不通时运行 `--setup-chrome`，仅安装 Edge 时用 `--setup-edge`。用户在专用浏览器登录后重新检查。专用持久 profile 位于 `~/.boss-zhipin-scraper/chrome-profile`，复用其登录态，默认不复制主浏览器数据。
 
 ```text
-PYTHON SCRIPT_PATH --keyword "嵌入式软件工程师" --city 深圳 --pages 3 --output "绝对路径/jobs.json"
+PYTHON SCRIPT_PATH --keyword "嵌入式软件工程师" --city 深圳 --output "绝对路径/jobs.json"
 ```
 
 默认同时生成 `jobs.json` 和 `jobs.csv`，列表和详情位于同一对文件。`--format json` 只生成 JSON；`--format csv` 生成二者，也是默认值。输出使用用户指定位置或当前工作区；脚本无参数默认目录为 `~/.boss-zhipin-scraper/job-result/`。
@@ -61,7 +61,10 @@ CSV 使用 UTF-8 BOM，所有 32 列固定存在；数组以 JSON 字符串保�
 ## 状态与边界
 
 - `success`：已取得职位描述；`partial`：只取得部分内容、未找到描述区域或遇到登录墙/人工验证；`failed`：缺链接、空页面或连接/提取失败；`not_attempted`：尚未处理或被显式限制、中断阻止。
-- 列表被动捕获页面自身请求，通过滚动加载下一批，不注入同步 XHR。单次最多 10 批，保留现有请求间隔。
+- 列表被动捕获页面自身请求，通过滚动加载下一页，不注入同步 XHR。默认不设固定页数或请求总量上限，保留现有请求间隔；只有用户显式限制或开发测试时才传 `--pages N`（可超过 10）。
+- 每页处理后，若至少 8 条岗位的招聘者活跃状态超过 7 天，或至少 8 条岗位的 `job_id` 已在本次当前城市前面的页面出现，就停止此城市。阈值固定为 8；去重前统计历史重复，同页内部重复不算历史重复。触发页的所有新岗位仍处理并保存，重复岗位复用详情，不重复访问。
+- 活跃状态优先采用详情结果。“8天前活跃”“30日内活跃”“本月活跃”等计入过期，“在线”“7日内活跃”不计入；缺失或“近期活跃”等不明确状态不计入。`--no-detail` 或详情受显式限制时只使用已取得状态。
+- 无更多结果、空页、捕获超时、连接异常或中断时保存后停止。JSON 顶层的 `pages_completed`、`stop_reason`、`last_page` 记录进度和停止原因；岗位仍严格保持 32 字段。
 - 验证或登录墙出现时，先保存这 32 个字段与剩余岗位的状态，再停止，请用户人工处理，不绕过验证。
 - `--max-details N` 只在用户明确限制或必要的开发测试时使用，未处理项仍保留；`--no-detail` 仅抓列表；`--detail-output` 可额外输出同样 32 字段的详情副本。
 - `--allow-dom-fallback` 默认关闭，DOM 薪资可能受字体影响。`--copy-login-state` 仅在用户明确要求时使用；`--reset-chrome-profile` 会清除专用登录态，不用于普通重启。

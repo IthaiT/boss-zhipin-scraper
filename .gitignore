@@ -61,3 +61,7 @@ boss_jobs_*.csv
 boss_details_*.json
 boss_details_*.csv
 validation_*/
+
+# Complete CSV snapshots waiting for a reader lock to be released
+*.csv.pending
+*.csv.tmp*

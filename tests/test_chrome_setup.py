@@ -1062,6 +1062,195 @@ class ChromeSetupTests(unittest.TestCase):
         capture.assert_called_once()
         self.assertEqual(result["total"], 1)
 
+    def _job_page(self, ids, has_more=True, activity="在线"):
+        return {"code": 0, "zpData": {"hasMore": has_more, "jobList": [
+            {"jobName": str(job_id), "salaryDesc": "10K", "encryptJobId": str(job_id),
+             "activeTimeDesc": activity} for job_id in ids]}}
+
+    def _scrape_responses(self, module, output, responses, limit=None, **kwargs):
+        cdp = FakeCaptureCDP()
+        with mock.patch.object(module.NetworkJoblistCapture, "wait_next_response", side_effect=responses) as capture:
+            result = self._run_scrape_list(module, cdp, str(output), pages=limit, **kwargs)
+        return result, capture.call_count
+
+    def test_eight_old_jobs_stop_after_saving_entire_page(self):
+        module = load_module()
+        page = self._job_page(range(15))
+        for job in page["zpData"]["jobList"][:8]:
+            job["activeTimeDesc"] = "30日内活跃"
+        with tempfile.TemporaryDirectory() as tmp:
+            output = pathlib.Path(tmp) / "jobs.json"
+            result, calls = self._scrape_responses(module, output, [page], fmt="csv")
+            saved = json.loads(output.read_text(encoding="utf-8"))
+            with output.with_suffix(".csv").open(encoding="utf-8-sig", newline="") as f:
+                self.assertEqual(len(list(csv.DictReader(f))), 15)
+        self.assertEqual(calls, 1)
+        self.assertEqual(result["stop_reason"], "inactive_threshold")
+        self.assertEqual(result["last_page"]["inactive_jobs"], 8)
+        self.assertEqual(saved["total"], 15)
+        self.assertEqual(saved["pages_completed"], 1)
+
+    def test_seven_old_jobs_and_unknown_activity_do_not_stop(self):
+        module = load_module()
+        page = self._job_page(range(15), activity="")
+        for job in page["zpData"]["jobList"][:7]:
+            job["activeTimeDesc"] = "30日内活跃"
+        with tempfile.TemporaryDirectory() as tmp:
+            result, calls = self._scrape_responses(module, pathlib.Path(tmp) / "jobs.json", [
+                page, self._job_page(["last"], has_more=False)])
+        self.assertEqual(calls, 2)
+        self.assertEqual(result["total"], 16)
+        self.assertEqual(result["stop_reason"], "end_of_results")
+
+    def test_eight_duplicate_ids_stop_but_keep_new_jobs_from_triggering_page(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            result, calls = self._scrape_responses(module, pathlib.Path(tmp) / "jobs.json", [
+                self._job_page(range(15)), self._job_page(list(range(8)) + list(range(15, 22)))])
+        self.assertEqual(calls, 2)
+        self.assertEqual(result["stop_reason"], "duplicate_threshold")
+        self.assertEqual(result["last_page"]["duplicate_jobs"], 8)
+        self.assertEqual(result["total"], 22)
+        self.assertEqual(len({j["job_id"] for j in result["jobs"]}), 22)
+
+    def test_seven_duplicates_do_not_stop_and_same_page_duplicates_are_deduplicated(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            result, calls = self._scrape_responses(module, pathlib.Path(tmp) / "jobs.json", [
+                self._job_page(range(15)),
+                self._job_page(list(range(7)) + list(range(15, 23))),
+                self._job_page(["last"] * 8, has_more=False)])
+        self.assertEqual(calls, 3)
+        self.assertEqual(result["total"], 24)
+        self.assertEqual(result["last_page"]["duplicate_jobs"], 0)
+        self.assertEqual(result["stop_reason"], "end_of_results")
+
+    def test_default_auto_search_passes_tenth_page(self):
+        module = load_module()
+        pages = [self._job_page([n], has_more=n < 12) for n in range(1, 13)]
+        with tempfile.TemporaryDirectory() as tmp:
+            output = pathlib.Path(tmp) / "jobs.json"
+            result, calls = self._scrape_responses(module, output, pages)
+            self.assertFalse(output.with_suffix(".csv").exists())
+        self.assertEqual(calls, 12)
+        self.assertEqual(result["pages_completed"], 12)
+        self.assertEqual(result["total"], 12)
+
+    def test_explicit_page_limit_is_honored(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            result, calls = self._scrape_responses(module, pathlib.Path(tmp) / "jobs.json", [
+                self._job_page([1]), self._job_page([2])], limit=2)
+        self.assertEqual(calls, 2)
+        self.assertEqual(result["stop_reason"], "page_limit")
+
+    def test_empty_last_page_and_timeout_stop_without_spinning(self):
+        for last, reason in ((self._job_page([], has_more=False), "end_of_results"),
+                             (self._job_page([]), "empty_page"), (None, "no_response")):
+            module = load_module()
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as tmp:
+                output = pathlib.Path(tmp) / "jobs.json"
+                result, calls = self._scrape_responses(module, output, [self._job_page([1]), last])
+                self.assertEqual(json.loads(output.read_text(encoding="utf-8"))["total"], 1)
+                self.assertEqual(calls, 2)
+                self.assertEqual(result["stop_reason"], reason)
+
+    def test_later_security_response_preserves_completed_pages(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            output = pathlib.Path(tmp) / "jobs.json"
+            with self.assertRaises(module.LoginGateError):
+                self._scrape_responses(module, output, [self._job_page([1]),
+                                                       {"code": 37, "message": "您的环境存在异常"}], fmt="csv")
+            saved = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(saved["total"], 1)
+            self.assertEqual(saved["stop_reason"], "security_check")
+            self.assertTrue(output.with_suffix(".csv").exists())
+
+    def test_stopping_uses_detail_activity_and_duplicates_do_not_repeat_details(self):
+        module = load_module()
+        visited = []
+
+        def details(data, max_details, **kwargs):
+            records = []
+            for job in data["jobs"]:
+                visited.append(job["job_id"])
+                records.append(dict(job, capture_status="success", capture_reason="",
+                                    raw_detail={"boss_active_status": "30日内活跃"}))
+            kwargs["on_update"](records)
+            return records
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(module, "scrape_details", side_effect=details):
+            result, calls = self._scrape_responses(module, pathlib.Path(tmp) / "jobs.json", [
+                self._job_page(range(7)), self._job_page(list(range(7)) + [7])], detail=True)
+        self.assertEqual(calls, 2)
+        self.assertEqual(result["stop_reason"], "inactive_threshold")
+        self.assertEqual(result["last_page"], {"total": 8, "duplicate_jobs": 7, "inactive_jobs": 8})
+        self.assertEqual(len(visited), 8)
+        self.assertEqual(len(set(visited)), 8)
+
+    def test_activity_buckets_and_job_identity_are_stable(self):
+        module = load_module()
+        for status in ("8天前活跃", "30日内活跃", "两周内活跃", "本月活跃", "1个月前活跃", "很久未活跃"):
+            with self.subTest(status=status):
+                self.assertTrue(module.is_inactive_over_seven_days(status))
+        for status in ("", None, "在线", "刚刚活跃", "昨日活跃", "7日内活跃", "一周内活跃", "近期活跃", "离线"):
+            with self.subTest(status=status):
+                self.assertFalse(module.is_inactive_over_seven_days(status))
+        one = {"job_link": "https://www.zhipin.com/job_detail/one.html?lid=1"}
+        two = {"job_link": "https://www.zhipin.com/job_detail/one.html?lid=2#new"}
+        self.assertEqual(module.ensure_job_id(one), module.ensure_job_id(two))
+        self.assertEqual(module.ensure_job_id({"job_id": "source-id"}), "source-id")
+        module._request_counter = 500
+        module.incr_request()
+        self.assertEqual(module._request_counter, 501)
+
+    def test_main_defaults_to_auto_and_does_not_clamp_explicit_pages(self):
+        for options, expected in (([], None), (["--pages", "12"], 12)):
+            module = load_module()
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as tmp:
+                output = pathlib.Path(tmp) / "jobs.json"
+                with mock.patch.object(sys, "argv", ["boss", "--output", str(output)] + options), \
+                        mock.patch.object(module, "require_runtime_dependencies", return_value=True), \
+                        mock.patch.object(module, "resolve_city", return_value=("上海", "101020100")), \
+                        mock.patch.object(module, "scrape_list", return_value={"jobs": []}) as scrape:
+                    module.main()
+                self.assertEqual(scrape.call_args.args[2], expected)
+                self.assertTrue(scrape.call_args.kwargs["detail"])
+
+    def test_merge_preserves_fresh_page_details_over_older_rows(self):
+        module = load_module()
+        fresh = {"job_id": "one", "job_description": "fresh", "capture_status": "success"}
+        with tempfile.TemporaryDirectory() as tmp:
+            output = pathlib.Path(tmp) / "jobs.json"
+            old = pathlib.Path(tmp) / "old.json"
+            old.write_text(json.dumps({"jobs": [dict(fresh, job_description="old"),
+                                                 {"job_id": "older-only", "job_description": "keep"}]}), encoding="utf-8")
+            with mock.patch.object(sys, "argv", ["boss", "--output", str(output), "--merge", str(old)]), \
+                    mock.patch.object(module, "require_runtime_dependencies", return_value=True), \
+                    mock.patch.object(module, "resolve_city", return_value=("上海", "101020100")), \
+                    mock.patch.object(module, "scrape_list", return_value={"jobs": [fresh]}), \
+                    mock.patch.object(module, "scrape_details") as details:
+                module.main()
+            details.assert_not_called()
+            saved = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual([j["job_description"] for j in saved["jobs"]], ["fresh", "keep"])
+
+    def test_main_does_not_fetch_page_details_twice(self):
+        module = load_module()
+        job = {"job_id": "one", "job_description": "C", "capture_status": "success", "capture_reason": ""}
+        with tempfile.TemporaryDirectory() as tmp:
+            output = pathlib.Path(tmp) / "jobs.json"
+            with mock.patch.object(sys, "argv", ["boss", "--output", str(output)]), \
+                    mock.patch.object(module, "require_runtime_dependencies", return_value=True), \
+                    mock.patch.object(module, "resolve_city", return_value=("上海", "101020100")), \
+                    mock.patch.object(module, "scrape_list", return_value={"jobs": [job]}), \
+                    mock.patch.object(module, "scrape_details") as details:
+                module.main()
+            details.assert_not_called()
+            self.assertEqual(json.loads(output.read_text(encoding="utf-8"))["jobs"][0]["job_description"], "C")
+
     def test_scrape_list_gates_on_risk_control_first_response(self):
         module = load_module()
         restricted = {"code": 37, "message": "您的环境存在异常."}
@@ -1879,6 +2068,23 @@ class RawExportTests(unittest.TestCase):
                 list_output_path=str(output), **kwargs,
             )
 
+    def test_detail_progress_callback_publishes_real_results_without_extra_files(self):
+        module = load_module()
+        snapshots = []
+        session = self.make_session(module, {"jd": "C", "page_text": "原文"})
+        with mock.patch.object(module, "CDPSession", return_value=session), \
+                mock.patch.object(module, "create_page_session", return_value=("target", "session")), \
+                mock.patch.object(module.time, "sleep"), \
+                mock.patch.object(module, "default_output_path", side_effect=AssertionError("unexpected file")):
+            module.scrape_details(
+                {"jobs": [self.job(), self.job("next")]}, max_details=1,
+                on_update=lambda records: snapshots.append([module.export_job_record(r) for r in records]),
+            )
+        self.assertEqual(snapshots[0][0]["capture_status"], "not_attempted")
+        self.assertEqual(snapshots[-1][0]["capture_status"], "success")
+        self.assertEqual(snapshots[-1][0]["job_description"], "C")
+        self.assertEqual(snapshots[-1][1]["capture_reason"], "max_details")
+
     def test_raw_api_item_preserves_unknown_fields_and_unlimited_tags(self):
         module = load_module()
         raw = {"jobName": "C工程师", "jobExperience": "不限", "jobDegree": "不限",
@@ -2268,6 +2474,24 @@ class CsvSnapshotTests(unittest.TestCase):
             self.assertTrue(module.write_csv(path, [{"job_id": "page3"}]))
             self.assertFalse(pending.exists())
             self.assertEqual([p.name for p in pathlib.Path(tmp).iterdir()], ["jobs.csv"])
+
+    def test_real_open_reader_keeps_its_snapshot_and_does_not_crash_writer(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "jobs.csv"
+            module.write_csv(path, [{"job_id": "old"}])
+            original = path.read_bytes()
+            with path.open("rb") as reader:
+                published = module.write_csv(path, [{"job_id": "new"}])
+                self.assertEqual(reader.read(), original)
+                if os.name == "nt":
+                    self.assertFalse(published)
+                    self.assertTrue(pathlib.Path(str(path) + ".pending").exists())
+                else:
+                    self.assertTrue(published)
+            self.assertTrue(module.write_csv(path, [{"job_id": "new"}]))
+            with path.open(encoding="utf-8-sig", newline="") as reader:
+                self.assertEqual(next(csv.DictReader(reader))["job_id"], "new")
 
     def test_serialization_failure_does_not_truncate_csv(self):
         module = load_module()

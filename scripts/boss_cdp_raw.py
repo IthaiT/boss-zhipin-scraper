@@ -76,9 +76,8 @@ API_JOB_LIST_PATH = "/wapi/zpgeek/search/joblist.json"
 HOT_CITY_URL = "https://www.zhipin.com/wapi/zpgeek/search/job/hot/city.json"
 CITY_GROUP_URL = "https://www.zhipin.com/wapi/zpCommon/data/cityGroup.json"
 
-# 请求频率保护
-MAX_PAGES = 10          # 单次最大页数
-MAX_API_REQUESTS = 500  # 单次最大 API 请求数
+# 逐页停止阈值；继续保留列表和详情之间的请求间隔。
+PAGE_STOP_THRESHOLD = 8
 
 
 MACOS_BROWSER_CANDIDATES = (
@@ -352,13 +351,10 @@ INDUSTRY_MAP = {
 # 全局请求计数器辅助
 # ============================================================
 def incr_request():
-    """递增全局请求计数，达到上限时抛出异常"""
+    """Count requests for diagnostics without imposing an arbitrary run limit."""
     global _request_counter
     _request_counter += 1
-    if _request_counter > MAX_API_REQUESTS:
-        raise RuntimeError(f"已达到单次最大请求数 {MAX_API_REQUESTS}，停止抓取")
-    if _request_counter >= MAX_API_REQUESTS * 0.8:
-        log.warning(f"⚠️ 请求次数接近上限: {_request_counter}/{MAX_API_REQUESTS}")
+    log.debug(f"本次请求计数: {_request_counter}")
 
 
 # ============================================================
@@ -780,6 +776,54 @@ def map_list_boss_active_status(job):
     if job.get("bossOnline"):
         return "在线"
     return ""
+
+
+def is_inactive_over_seven_days(status):
+    """Recognize older activity buckets; missing/ambiguous labels stay unknown."""
+    status = re.sub(r"\s+", "", str(status or ""))
+    if status in {"本月活跃", "月内活跃", "一个月内活跃", "近一个月活跃",
+                  "半月内活跃", "半个月内活跃", "半年前活跃", "很久未活跃",
+                  "长期未活跃", "很久没活跃"}:
+        return True
+    match = re.fullmatch(
+        r"(?:近)?(\d+|[一二两三四五六七八九十]+)(分钟|小时|天|日|周|个月|月|年)(?:内|前)?活跃",
+        status,
+    )
+    if not match:
+        return False
+    number, unit = match.groups()
+    if number.isdigit():
+        count = int(number)
+    else:
+        digits = {c: i for i, c in enumerate("零一二三四五六七八九")}
+        digits["两"] = 2
+        if "十" in number:
+            tens, ones = number.split("十", 1)
+            if (tens and tens not in digits) or (ones and ones not in digits):
+                return False
+            count = digits.get(tens, 1) * 10 + digits.get(ones, 0)
+        else:
+            count = digits.get(number)
+            if count is None:
+                return False
+    days = {"分钟": 1 / 1440, "小时": 1 / 24, "天": 1, "日": 1,
+            "周": 7, "个月": 30, "月": 30, "年": 365}
+    return count * days[unit] > 7
+
+
+def ensure_job_id(job):
+    """Keep existing IDs; hash a canonical job link without changing legacy IDs."""
+    if job.get("job_id"):
+        job["job_id"] = str(job["job_id"])
+        return job["job_id"]
+    link = job.get("job_link")
+    if link:
+        parsed = urlparse(link)
+        key = urlunparse(parsed._replace(query="", fragment=""))
+    else:
+        key = json.dumps(job.get("raw_list", job), ensure_ascii=False, sort_keys=True)
+    job["job_id"] = hashlib.md5(key.encode()).hexdigest()[:16]
+    return job["job_id"]
 
 
 def resolve_boss_active_status(list_status="", detail_status=""):
@@ -1774,6 +1818,8 @@ def load_existing_details(input_path=None, detail_output=None, result_dir=DEFAUL
 def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 cdp_port=DEFAULT_CDP_PORT, fmt="json", allow_dom_fallback=False,
                 diff_base=None, detail=False, max_details=None, detail_output=None):
+    if max_pages is not None and max_pages < 1:
+        raise ValueError("max_pages must be positive or None")
     city_name, city_code = resolve_city(city_input)
     cdp = CDPSession(cdp_port)
     all_jobs = []
@@ -1824,14 +1870,14 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 filter_desc.append(f"行业={k}")
 
     print(f"=== BOSS直聘抓取 ===")
-    print(f"关键词: {keyword} | 城市: {city_name} | 页数: {max_pages}")
+    print(f"关键词: {keyword} | 城市: {city_name} | 页数: {max_pages or '自动停止'}")
     if filter_desc:
         print(f"筛选: {' | '.join(filter_desc)}")
     print()
 
     meta = {
         "keyword": keyword, "city": city_name, "filters": filters,
-        "filter_desc": filter_desc,
+        "filter_desc": filter_desc, "pages_completed": 0, "stop_reason": "",
     }
 
     def save_progress():
@@ -1878,25 +1924,29 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 "type": "mouseMoved", "x": x, "y": y
             }, sid)
 
-    def gate_first_response(data):
-        """用首个真实搜索响应判定登录/风控（#53：不再单独发固定探测请求）。"""
+    def gate_response(data, first=False):
+        """Check every captured response without an extra login probe request."""
         result = classify_login_probe_response(data)
         if result.status is LoginProbeStatus.AVAILABLE:
-            print("✅ 已登录\n")
+            if first:
+                print("✅ 已登录\n")
             return
         if result.status is LoginProbeStatus.UNAUTHENTICATED:
+            meta["stop_reason"] = "login_required"
             raise LoginGateError(
                 "❌ 未检测到 BOSS直聘登录状态。请先在 Chrome 中登录 zhipin.com。\n"
                 "   可运行 --check 检查环境，或 --setup-chrome 启动 Chrome。"
             )
         if result.status is LoginProbeStatus.RESTRICTED:
+            meta["stop_reason"] = "security_check"
             raise LoginGateError(
                 f"❌ {describe_login_probe_result(result)}，已停止抓取。\n"
                 f"   请先在浏览器中完成验证或稍后再试，不要重复运行登录探测。"
             )
         if result.status is LoginProbeStatus.EMPTY:
-            print(f"⚠️  {describe_login_probe_result(result)}；继续执行实际职位搜索。\n")
+            print(f"⚠️  {describe_login_probe_result(result)}。\n")
             return
+        meta["stop_reason"] = "response_error"
         raise LoginGateError(
             f"❌ {describe_login_probe_result(result)}，已停止抓取。"
         )
@@ -1906,8 +1956,10 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
         # 原先 enable 位于 try 外，任何异常都会裸崩且跳过 finally 清理（#78）
         capture = NetworkJoblistCapture(cdp, sid)
         capture.enable()
-        for pg in range(1, max_pages + 1):
-            print(f"--- [{pg}/{max_pages} 页, {len(all_jobs)} 条已抓] ---")
+        pg = 0
+        while max_pages is None or pg < max_pages:
+            pg += 1
+            print(f"--- [{pg}/{max_pages or '自动'} 页, {len(all_jobs)} 条已抓] ---")
 
             if pg == 1:
                 # 导航真实搜索页，被动等待页面自己发出首个 joblist 请求
@@ -1925,12 +1977,14 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                     # 捕获超时：页面可能被重定向到验证/登录页，交由 DOM 兜底
                     log.warning("⚠️ 未捕获到页面自身的搜索响应")
                 else:
-                    gate_first_response(data)
+                    gate_response(data, first=True)
             else:
                 # 翻页：滚动到底触发无限滚动加载，继续旁听页面自身请求
                 human_scroll(cdp, sid, to_bottom=True)
                 data = capture.wait_next_response(timeout=20)
                 incr_request()
+                if data is not None:
+                    gate_response(data)
 
             reached_end = (
                 isinstance(data, dict)
@@ -1959,26 +2013,24 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 human_mouse_jitter(cdp, sid)
 
             if not jobs:
-                print("  ⚠️ 无数据")
-                continue
+                meta["stop_reason"] = "end_of_results" if reached_end else (
+                    "no_response" if data is None else "empty_page"
+                )
+                print(f"  无数据，停止此城市搜索（{meta['stop_reason']}）。")
+                break
 
             page_start = len(all_jobs)
+            # Count against previous pages before deduplicating the current page.
+            duplicate_count = sum(ensure_job_id(job) in seen for job in jobs)
             new = 0
-            new_count = 0
             for j in jobs:
-                key = j.get('job_link') or json.dumps(
-                    j.get('raw_list', j), ensure_ascii=False, sort_keys=True
-                )
-                j['job_id'] = hashlib.md5(key.encode()).hexdigest()[:16]
-                if key in seen:
+                if j["job_id"] in seen:
                     continue
-                seen.add(key)
+                seen.add(j["job_id"])
                 # is_new(#88):该岗位不在历史基准中,即本轮新增
                 j['is_new'] = j['job_id'] not in base_ids
                 all_jobs.append(j)
                 new += 1
-                if j['is_new']:
-                    new_count += 1
                 salary = j.get('salary','?')
                 scale = j.get('company_scale', '')
                 active = j.get('boss_active_status', '')
@@ -2006,44 +2058,75 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 for job in all_jobs[page_start:]:
                     job.setdefault("capture_status", "not_attempted")
                     job.setdefault("capture_reason", "no_detail")
-            save_progress()
-
+            records_by_id = {job["job_id"]: job for job in all_jobs}
+            inactive_count = sum(
+                is_inactive_over_seven_days(
+                    export_job_record(records_by_id[job["job_id"]])["boss_active_status"]
+                ) for job in jobs
+            )
+            meta["pages_completed"] = pg
+            meta["last_page"] = {
+                "total": len(jobs), "duplicate_jobs": duplicate_count,
+                "inactive_jobs": inactive_count,
+            }
             stop_reasons = {job.get("capture_reason") for job in all_jobs[page_start:]}
-            if stop_reasons & {"login_required", "security_check", "interrupted"}:
-                print("  详情采集停止，已保存当前城市全部已读取岗位。")
+            gate = next((reason for reason in ("security_check", "login_required", "interrupted")
+                         if reason in stop_reasons), "")
+            if gate:
+                meta["stop_reason"] = gate
+            elif duplicate_count >= PAGE_STOP_THRESHOLD:
+                meta["stop_reason"] = "duplicate_threshold"
+            elif inactive_count >= PAGE_STOP_THRESHOLD:
+                meta["stop_reason"] = "inactive_threshold"
+            elif reached_end:
+                meta["stop_reason"] = "end_of_results"
+            elif max_pages is not None and pg >= max_pages:
+                meta["stop_reason"] = "page_limit"
+            save_progress()
+            print(f"  本页重复 {duplicate_count} 条，超过 7 天未活跃 {inactive_count} 条"
+                  f"（停止阈值均为 {PAGE_STOP_THRESHOLD} 条）。")
+            if meta["stop_reason"]:
+                print(f"  停止此城市搜索：{meta['stop_reason']}。已保存本页所有新岗位。\n")
                 break
 
-            if reached_end:
-                print("  已到最后一页（hasMore=false），提前结束\n")
-                break
-
-            if pg < max_pages:
-                d = random.uniform(12, 22)
-                print(f"  翻页等待 {d:.0f}s...\n")
-                time.sleep(d)
+            d = random.uniform(12, 22)
+            print(f"  翻页等待 {d:.0f}s...\n")
+            time.sleep(d)
 
     except KeyboardInterrupt:
+        meta["stop_reason"] = "interrupted"
         print("\n中断")
     except CDP_TRANSIENT_EXCEPTIONS as e:
         # CDP 传输层瞬态异常：优雅停止并保留已抓数据（每页已增量写盘），不裸崩（#78）
+        meta["stop_reason"] = "connection_error"
         print(f"\n⚠️ CDP 连接异常，已停止抓取: {e}")
     except RuntimeError as e:
+        meta["stop_reason"] = "runtime_error"
         print(f"\n⚠️ {e}")
     finally:
-        cdp.send("Target.closeTarget", {"targetId": tid})
-        cdp.close()
+        try:
+            save_progress()
+        finally:
+            try:
+                cdp.send("Target.closeTarget", {"targetId": tid})
+            except CDP_TRANSIENT_EXCEPTIONS + (OSError, RuntimeError) as exc:
+                log.warning(f"列表标签页关闭失败: {exc}")
+            finally:
+                try:
+                    cdp.close()
+                except CDP_TRANSIENT_EXCEPTIONS + (OSError, RuntimeError) as exc:
+                    log.warning(f"列表连接关闭失败: {exc}")
 
     print(f"\n{'='*60}")
     new_total = len([j for j in all_jobs if j.get('is_new')])
     print(f"完成: {len(all_jobs)} 条,其中新增 {new_total} 条(🆕)")
 
     if all_jobs:
-        save_progress()
         print(f"已保存: {output_path}")
     else:
         print("无数据")
 
-    return {"keyword": keyword, "city": city_name, "total": len(all_jobs), "jobs": all_jobs}
+    return dict(meta, total=len(all_jobs), jobs=all_jobs)
 
 
 # ============================================================
@@ -2101,6 +2184,8 @@ def scrape_details(list_data, max_details=None, output_path=None,
     def save(export_csv=False):
         if on_update is not None:
             on_update(results)
+            if not output_path and not list_output_path:
+                return
         exported = [export_job_record(job) for job in results]
         if output_path:
             _atomic_write_json(output_path, exported)
@@ -2950,7 +3035,7 @@ def main():
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     p.add_argument("--keyword", default="AI Agent", help="搜索关键词")
     p.add_argument("--city", default=DEFAULT_CITY_INPUT, help=f"城市 (中文名或代码，默认 {DEFAULT_CITY_INPUT})")
-    p.add_argument("--pages", type=int, default=3, help=f"抓取页数 (最大 {MAX_PAGES})")
+    p.add_argument("--pages", type=int, default=None, help="可选页数上限；默认按活跃状态/重复岗位自动停止")
     p.add_argument("--output", default=None, help="列表数据输出路径")
     p.add_argument("--diff-base", default=None, help="is_new 对比基准文件(默认自动取同关键词同城市、日期早于本轮的最近一份结果)")
     p.add_argument("--detail-output", default=None, help="可选：额外保存独立详情文件（默认详情直接写入 --output）")
@@ -3010,7 +3095,7 @@ def main():
                    help="抓取正常结束后自动关闭专用 Chrome（默认不关；异常退出不触发，保留登录态）")
 
     args = p.parse_args()
-    if args.pages < 1:
+    if args.pages is not None and args.pages < 1:
         p.error("--pages 必须大于零")
     if args.max_details is not None and args.max_details < 0:
         p.error("--max-details 不能为负数")
@@ -3060,11 +3145,6 @@ def main():
             print(f"❌ {e}")
             sys.exit(1)
 
-    # 页数限制
-    if args.pages > MAX_PAGES:
-        print(f"⚠️ 页数 {args.pages} 超过上限 {MAX_PAGES}，已自动调整为 {MAX_PAGES}")
-        args.pages = MAX_PAGES
-
     # 收集筛选条件
     filters = {}
     for key in ["scale", "stage", "salary", "experience", "degree", "industry"]:
@@ -3099,7 +3179,12 @@ def main():
     # 合并外部文件
     merged_details = None
     if args.merge:
-        merged_jobs = merge_jobs(args.merge, list_data.get("jobs", []))
+        current_jobs = list_data.get("jobs", [])
+        merged_jobs = merge_jobs(args.merge, current_jobs)
+        if args.detail and not args.input:
+            # Fresh pages already contain details; an old merged row must not
+            # overwrite those results now that there is no second detail pass.
+            merged_jobs = merge_unique(merged_jobs, current_jobs, new_overrides=True)
         list_data["jobs"] = merged_jobs
         list_data["total"] = len(merged_jobs)
         # 重新保存合并结果
