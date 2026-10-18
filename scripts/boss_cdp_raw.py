@@ -1773,7 +1773,7 @@ def load_existing_details(input_path=None, detail_output=None, result_dir=DEFAUL
 # ============================================================
 def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 cdp_port=DEFAULT_CDP_PORT, fmt="json", allow_dom_fallback=False,
-                diff_base=None):
+                diff_base=None, detail=False, max_details=None, detail_output=None):
     city_name, city_code = resolve_city(city_input)
     cdp = CDPSession(cdp_port)
     all_jobs = []
@@ -1828,6 +1828,23 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
     if filter_desc:
         print(f"筛选: {' | '.join(filter_desc)}")
     print()
+
+    meta = {
+        "keyword": keyword, "city": city_name, "filters": filters,
+        "filter_desc": filter_desc,
+    }
+
+    def save_progress():
+        exported = [export_job_record(job) for job in all_jobs]
+        payload = dict(meta, total=len(exported), jobs=exported,
+                       scraped_at=datetime.now().isoformat())
+        _atomic_write_json(output_path, payload)
+        if fmt == "csv":
+            write_csv(os.path.splitext(output_path)[0] + ".csv", all_jobs)
+        if detail_output:
+            _atomic_write_json(detail_output, exported)
+            if fmt == "csv":
+                write_detail_csv(os.path.splitext(detail_output)[0] + ".csv", all_jobs)
 
     tid, sid = create_page_session(cdp)
 
@@ -1945,6 +1962,7 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 print("  ⚠️ 无数据")
                 continue
 
+            page_start = len(all_jobs)
             new = 0
             new_count = 0
             for j in jobs:
@@ -1972,15 +1990,28 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
 
             print(f"  本页 {len(jobs)} 条, 新增 {new}, 累计 {len(all_jobs)}")
 
-            # 每页抓完就写入文件，异常退出也能保留
-            if output_path:
-                flush_jobs(output_path, {
-                    "keyword": keyword,
-                    "city": city_name,
-                    "filters": filters,
-                    "filter_desc": filter_desc,
-                    "scraped_at": datetime.now().isoformat(),
-                }, all_jobs)
+            if detail and new:
+                # A page is processed before the next scroll. Keep earlier pages
+                # in every snapshot, including saves made during detail capture.
+                def update_page(records):
+                    all_jobs[page_start:] = records
+                    save_progress()
+
+                remaining = None if max_details is None else max(0, max_details - page_start)
+                scrape_details(
+                    dict(meta, jobs=all_jobs[page_start:]), remaining,
+                    cdp_port=cdp_port, fmt=fmt, on_update=update_page,
+                )
+            else:
+                for job in all_jobs[page_start:]:
+                    job.setdefault("capture_status", "not_attempted")
+                    job.setdefault("capture_reason", "no_detail")
+            save_progress()
+
+            stop_reasons = {job.get("capture_reason") for job in all_jobs[page_start:]}
+            if stop_reasons & {"login_required", "security_check", "interrupted"}:
+                print("  详情采集停止，已保存当前城市全部已读取岗位。")
+                break
 
             if reached_end:
                 print("  已到最后一页（hasMore=false），提前结束\n")
@@ -2007,20 +2038,8 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
     print(f"完成: {len(all_jobs)} 条,其中新增 {new_total} 条(🆕)")
 
     if all_jobs:
-        # 最终写入（含时间戳更新）
-        flush_jobs(output_path, {
-            "keyword": keyword,
-            "city": city_name,
-            "filters": filters,
-            "filter_desc": filter_desc,
-            "scraped_at": datetime.now().isoformat(),
-        }, all_jobs)
+        save_progress()
         print(f"已保存: {output_path}")
-
-        # CSV 导出
-        if fmt == "csv":
-            csv_path = output_path.rsplit(".", 1)[0] + ".csv"
-            write_csv(csv_path, all_jobs)
     else:
         print("无数据")
 
@@ -2062,12 +2081,13 @@ def build_detail_record(job, extracted):
 
 
 def scrape_details(list_data, max_details=None, output_path=None,
-                   cdp_port=DEFAULT_CDP_PORT, fmt="csv", list_output_path=None):
+                   cdp_port=DEFAULT_CDP_PORT, fmt="csv", list_output_path=None,
+                   on_update=None):
     """Save every listing, full page text, and failures without cleaning a JD."""
     jobs = list_data.get("jobs", [])
     if max_details is not None and max_details < 0:
         raise ValueError("max_details must be non-negative")
-    if not output_path and not list_output_path:
+    if not output_path and not list_output_path and on_update is None:
         output_path = default_output_path("details")
 
     print(f"\n=== 抓取岗位详情 ({len(jobs)} 个) ===\n")
@@ -2079,6 +2099,8 @@ def scrape_details(list_data, max_details=None, output_path=None,
         )
 
     def save(export_csv=False):
+        if on_update is not None:
+            on_update(results)
         exported = [export_job_record(job) for job in results]
         if output_path:
             _atomic_write_json(output_path, exported)
@@ -3067,7 +3089,8 @@ def main():
                 args.keyword, args.city, args.pages, filters, args.output,
                 cdp_port=args.cdp_port, fmt=args.format,
                 allow_dom_fallback=args.allow_dom_fallback,
-                diff_base=args.diff_base,
+                diff_base=args.diff_base, detail=args.detail,
+                max_details=args.max_details, detail_output=args.detail_output,
             )
         except LoginGateError as e:
             print(str(e))
@@ -3099,11 +3122,14 @@ def main():
     # 抓详情
     details = None
     if args.detail and list_data.get("jobs"):
-        details = scrape_details(
-            list_data, args.max_details, args.detail_output,
-            cdp_port=args.cdp_port, fmt=args.format,
-            list_output_path=args.output,
-        )
+        if args.input:
+            details = scrape_details(
+                list_data, args.max_details, args.detail_output,
+                cdp_port=args.cdp_port, fmt=args.format,
+                list_output_path=args.output,
+            )
+        else:
+            details = list_data["jobs"]  # Already processed once, page by page.
         # 若处于合并流程，把旧详情并入本次抓取结果并重新落盘，保证 --merge 后详情不丢失
         if merged_details and args.detail_output:
             details = merge_details_from_lists(merged_details, details)
@@ -3117,10 +3143,10 @@ def main():
         for job in list_data.get("jobs", []):
             job.setdefault("capture_status", "not_attempted")
             job.setdefault("capture_reason", "no_detail")
-        payload = dict(list_data, jobs=[export_job_record(job) for job in list_data.get("jobs", [])])
-        _atomic_write_json(args.output, payload)
-        if args.format == "csv":
-            write_csv(args.output.rsplit(".", 1)[0] + ".csv", list_data.get("jobs", []))
+    payload = dict(list_data, jobs=[export_job_record(job) for job in list_data.get("jobs", [])])
+    _atomic_write_json(args.output, payload)
+    if args.format == "csv":
+        write_csv(args.output.rsplit(".", 1)[0] + ".csv", list_data.get("jobs", []))
 
     print(f"原始数据已保存: {args.output}")
 

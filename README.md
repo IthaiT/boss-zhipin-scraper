@@ -41,6 +41,8 @@ job_id captured_at capture_status capture_reason
 
 CSV 使用 UTF-8 BOM，技能数组以 JSON 字符串保存。默认不运行旧 `job_summary.py`、统计、摘要或提示词生成，不读取本地简历文件。
 
+采集按页进行：读取一页列表 → 处理该页新岗位的详情 → 更新累计 JSON/CSV → 再加载下一页。每页完成即可重新读取同一个 CSV 查看完整详情；`--no-detail` 每页更新列表，`--max-details` 在整个城市内累计计数，重复岗位不重复访问详情。
+
 CSV 先写完整快照，再原子替换，读取时不会看到半截文件；已打开的读取器可能仍持有上一版，需要重新打开或刷新。若 Windows/Excel 锁住目标文件，会保留原 CSV，并将最新完整数据保存为 `jobs.csv.pending`，后续每次保存自动重试。若结束时仍被占用，关闭占用程序后将 `.pending` 文件替换为原 CSV。
 
 专用持久 profile 位于 `~/.boss-zhipin-scraper/chrome-profile`，默认不复制主浏览器数据。仅用户明确要求时使用 `--copy-login-state`；`--reset-chrome-profile` 清除专用登录态，`--stop-chrome` / `--stop-edge` 仅关闭专用 profile。默认结果目录为 `~/.boss-zhipin-scraper/job-result/`。

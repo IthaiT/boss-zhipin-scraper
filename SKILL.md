@@ -56,6 +56,8 @@ PYTHON SCRIPT_PATH --keyword "嵌入式软件工程师" --city 深圳 --pages 3 
 
 CSV 使用 UTF-8 BOM，所有 32 列固定存在；数组以 JSON 字符串保存，正文不截断。返回文件链接及岗位数、失败数即可。
 
+每页依次读取列表、处理该页新岗位详情、更新累计 JSON/CSV，再加载下一页。CSV 采用完整快照原子替换，读取器需刷新或重新打开；Windows/Excel 锁文件时保留旧 CSV 和最新 `.csv.pending`，后续保存重试，结束后仍占用时可关闭读取器并将 pending 快照替换为 CSV。`--max-details` 按整个城市累计，重复岗位不重复抓详情。
+
 ## 状态与边界
 
 - `success`：已取得职位描述；`partial`：只取得部分内容、未找到描述区域或遇到登录墙/人工验证；`failed`：缺链接、空页面或连接/提取失败；`not_attempted`：尚未处理或被显式限制、中断阻止。

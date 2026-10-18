@@ -939,7 +939,7 @@ class ChromeSetupTests(unittest.TestCase):
         self.assertTrue(result.retryable)
         self.assertEqual(module._request_counter, 1)
 
-    def _run_scrape_list(self, module, cdp, output_path, pages=2):
+    def _run_scrape_list(self, module, cdp, output_path, pages=2, **kwargs):
         """以 mock 掉节奏/连接的方式跑一遍 scrape_list，返回其结果。
 
         module 必须与断言用的同一个 load_module() 实例（每次 load_module
@@ -951,7 +951,7 @@ class ChromeSetupTests(unittest.TestCase):
                 mock.patch("time.sleep", lambda s: None), \
                 mock.patch.object(module, "random", random.Random(7)):
             return module.scrape_list(
-                "Java", "上海", pages, {}, output_path, cdp_port=9333,
+                "Java", "上海", pages, {}, output_path, cdp_port=9333, **kwargs,
             )
 
     def test_scrape_list_captures_pages_via_network_events(self):
@@ -984,6 +984,83 @@ class ChromeSetupTests(unittest.TestCase):
         ]
         self.assertTrue(evaluate_bodies)
         self.assertFalse(any("XMLHttpRequest" in js for js in evaluate_bodies))
+
+    def test_page_details_and_cumulative_csv_are_saved_before_next_response(self):
+        module = load_module()
+        responses = [
+            {"code": 0, "zpData": {"hasMore": True, "jobList": [
+                {"jobName": "A", "salaryDesc": "10K", "encryptJobId": "a"}]}},
+            {"code": 0, "zpData": {"hasMore": False, "jobList": [
+                {"jobName": "B", "salaryDesc": "20K", "encryptJobId": "b"}]}},
+        ]
+        cdp = FakeCaptureCDP()
+        limits = []
+        with tempfile.TemporaryDirectory() as tmp:
+            output = pathlib.Path(tmp) / "jobs.json"
+            extra = pathlib.Path(tmp) / "details.json"
+
+            def response(*args, **kwargs):
+                if len(responses) == 1:
+                    with output.with_suffix(".csv").open(encoding="utf-8-sig", newline="") as f:
+                        rows = list(csv.DictReader(f))
+                    self.assertEqual([r["title"] for r in rows], ["A"])
+                    self.assertEqual(rows[0]["job_description"], "A description")
+                    self.assertEqual(rows[0]["capture_status"], "success")
+                return responses.pop(0)
+
+            def details(data, max_details, **kwargs):
+                limits.append(max_details)
+                records = [dict(j, job_description=j["title"] + " description",
+                                capture_status="success", capture_reason="") for j in data["jobs"]]
+                kwargs["on_update"](records)
+                return records
+
+            with mock.patch.object(module.NetworkJoblistCapture, "wait_next_response", side_effect=response), \
+                    mock.patch.object(module, "scrape_details", side_effect=details):
+                result = self._run_scrape_list(module, cdp, str(output), fmt="csv", detail=True,
+                                               max_details=1, detail_output=str(extra))
+            with output.with_suffix(".csv").open(encoding="utf-8-sig", newline="") as f:
+                rows = list(csv.DictReader(f))
+            self.assertEqual([r["title"] for r in rows], ["A", "B"])
+            self.assertEqual([r["title"] for r in json.loads(extra.read_text(encoding="utf-8"))], ["A", "B"])
+            self.assertEqual(result["total"], 2)
+            self.assertEqual(limits, [1, 0])
+
+    def test_listing_only_csv_is_updated_before_next_page(self):
+        module = load_module()
+        cdp = FakeCaptureCDP()
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp:
+            output = pathlib.Path(tmp) / "jobs.json"
+
+            def response(*args, **kwargs):
+                if calls:
+                    with output.with_suffix(".csv").open(encoding="utf-8-sig", newline="") as f:
+                        self.assertEqual(len(list(csv.DictReader(f))), 1)
+                calls.append(True)
+                return {"code": 0, "zpData": {"hasMore": len(calls) < 2, "jobList": [
+                    {"jobName": str(len(calls)), "salaryDesc": "10K", "encryptJobId": str(len(calls))}]}}
+
+            with mock.patch.object(module.NetworkJoblistCapture, "wait_next_response", side_effect=response):
+                self._run_scrape_list(module, cdp, str(output), fmt="csv")
+
+    def test_detail_security_gate_prevents_loading_next_list_page(self):
+        module = load_module()
+        cdp = FakeCaptureCDP()
+        response = {"code": 0, "zpData": {"hasMore": True, "jobList": [
+            {"jobName": "A", "salaryDesc": "10K", "encryptJobId": "a"}]}}
+
+        def details(data, max_details, **kwargs):
+            records = [dict(j, capture_status="partial", capture_reason="security_check") for j in data["jobs"]]
+            kwargs["on_update"](records)
+            return records
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(module.NetworkJoblistCapture, "wait_next_response", return_value=response) as capture, \
+                mock.patch.object(module, "scrape_details", side_effect=details):
+            result = self._run_scrape_list(module, cdp, str(pathlib.Path(tmp) / "jobs.json"), detail=True)
+        capture.assert_called_once()
+        self.assertEqual(result["total"], 1)
 
     def test_scrape_list_gates_on_risk_control_first_response(self):
         module = load_module()
