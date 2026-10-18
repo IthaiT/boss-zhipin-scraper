@@ -1443,30 +1443,44 @@ def csv_value(value):
 
 
 def write_csv(csv_path, jobs):
-    """将 jobs 列表写入 CSV 文件"""
+    """Publish a complete CSV snapshot; keep a pending copy if a reader locks it."""
+    csv_path = os.fspath(csv_path)
     os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
-    with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS, extrasaction="ignore")
-        writer.writeheader()
-        for j in jobs:
-            # 确保每列都有值
-            exported = export_job_record(j)
-            row = {col: csv_value(exported[col]) for col in CSV_COLUMNS}
-            writer.writerow(row)
-    print(f"CSV 已保存: {csv_path}")
+    tmp_path = f"{csv_path}.tmp{os.getpid()}"
+    pending_path = f"{csv_path}.pending"
+    try:
+        with open(tmp_path, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS, extrasaction="ignore")
+            writer.writeheader()
+            for job in jobs:
+                exported = export_job_record(job)
+                writer.writerow({col: csv_value(exported[col]) for col in CSV_COLUMNS})
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.replace(tmp_path, csv_path)
+        except PermissionError:
+            # Excel and some Windows readers deny replacement while open. Do not
+            # truncate their snapshot or discard this page's completed results.
+            os.replace(tmp_path, pending_path)
+            log.warning(f"CSV 被占用，保留原文件；最新完整快照: {pending_path}。"
+                        "关闭占用程序后，下一次保存会自动更新；若抓取已结束，可将快照重命名为 CSV。")
+            return False
+        if os.path.exists(pending_path):
+            try:
+                os.remove(pending_path)
+            except OSError as exc:
+                log.warning(f"旧 CSV 待更新快照清理失败: {exc}")
+        print(f"CSV 已保存: {csv_path}")
+        return True
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
 def write_detail_csv(csv_path, details):
-    """将岗位详情列表写入 CSV 文件"""
-    os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
-    with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=DETAIL_CSV_COLUMNS, extrasaction="ignore")
-        writer.writeheader()
-        for d in details:
-            exported = export_job_record(d)
-            row = {col: csv_value(exported[col]) for col in DETAIL_CSV_COLUMNS}
-            writer.writerow(row)
-    print(f"详情 CSV 已保存: {csv_path}")
+    """Publish detail snapshots with the same 32 fields and reader guarantees."""
+    return write_csv(csv_path, details)
 
 
 # ============================================================

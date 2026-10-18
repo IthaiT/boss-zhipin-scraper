@@ -2146,6 +2146,65 @@ def _normalize_version(raw):
     return f"{major}.{minor}"
 
 
+class CsvSnapshotTests(unittest.TestCase):
+    def test_readers_see_old_or_complete_new_snapshot(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "jobs.csv"
+            module.write_csv(path, [{"job_id": "old"}])
+            original = path.read_bytes()
+            replace = module.os.replace
+
+            def observe(source, target):
+                self.assertEqual(path.read_bytes(), original)
+                with open(source, encoding="utf-8-sig", newline="") as f:
+                    rows = list(csv.DictReader(f))
+                self.assertEqual([r["job_id"] for r in rows], ["new", "next"])
+                self.assertEqual(list(rows[0]), module.EXPORT_COLUMNS)
+                return replace(source, target)
+
+            with mock.patch.object(module.os, "replace", side_effect=observe):
+                self.assertTrue(module.write_csv(path, [{"job_id": "new"}, {"job_id": "next"}]))
+            self.assertTrue(path.read_bytes().startswith(b"\xef\xbb\xbf"))
+            self.assertEqual([p.name for p in pathlib.Path(tmp).iterdir()], ["jobs.csv"])
+
+    def test_locked_csv_keeps_latest_pending_snapshot_and_recovers(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "jobs.csv"
+            pending = pathlib.Path(str(path) + ".pending")
+            module.write_csv(path, [{"job_id": "old"}])
+            original = path.read_bytes()
+            replace = module.os.replace
+
+            def lock_destination(source, target):
+                if os.fspath(target) == str(path):
+                    raise PermissionError("reader denies replacement")
+                return replace(source, target)
+
+            with mock.patch.object(module.os, "replace", side_effect=lock_destination):
+                for job_id in ("page1", "page2"):
+                    self.assertFalse(module.write_csv(path, [{"job_id": job_id}]))
+            self.assertEqual(path.read_bytes(), original)
+            with pending.open(encoding="utf-8-sig", newline="") as f:
+                self.assertEqual(next(csv.DictReader(f))["job_id"], "page2")
+            self.assertTrue(module.write_csv(path, [{"job_id": "page3"}]))
+            self.assertFalse(pending.exists())
+            self.assertEqual([p.name for p in pathlib.Path(tmp).iterdir()], ["jobs.csv"])
+
+    def test_serialization_failure_does_not_truncate_csv(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "jobs.csv"
+            module.write_csv(path, [{"job_id": "old"}])
+            original = path.read_bytes()
+            with mock.patch.object(module, "export_job_record", side_effect=ValueError("bad row")):
+                with self.assertRaises(ValueError):
+                    module.write_csv(path, [{"job_id": "new"}])
+            self.assertEqual(path.read_bytes(), original)
+            self.assertEqual([p.name for p in pathlib.Path(tmp).iterdir()], ["jobs.csv"])
+
+
 class VersionConsistencyTests(unittest.TestCase):
     """校验版本号在 README / pyproject.toml / SKILL.md / 脚本四处保持一致。
 

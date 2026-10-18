@@ -41,6 +41,8 @@ No raw payloads, whole-page text, duplicate aliases, avatars, logos, tracking pa
 
 CSV uses UTF-8 BOM and stores skill arrays as JSON strings. Default exports do not run legacy `job_summary.py`, statistics, or prompts. No local resume files are read.
 
+CSV snapshots are written completely before atomic replacement, so readers see a complete file. Existing readers may retain an older snapshot and should reopen or refresh. If Windows/Excel locks the destination, the previous CSV stays intact and the latest complete data is saved as `jobs.csv.pending`; each subsequent save retries publication. If still locked at completion, close the reader and replace the CSV with the pending file.
+
 The dedicated persistent profile is `~/.boss-zhipin-scraper/chrome-profile`; main-browser data is not copied by default. Use `--copy-login-state` only when explicitly requested. `--reset-chrome-profile` clears the dedicated login; `--stop-chrome` / `--stop-edge` close only the dedicated profile. Default result directory: `~/.boss-zhipin-scraper/job-result/`.
 
 At most 10 batches per run, with existing request intervals. Manual verification and login walls stop further visits after saving approved fields and remaining-job statuses. `--no-detail` exports listings only; an explicit `--max-details N` retains excess jobs as unattempted.
