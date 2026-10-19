@@ -1137,6 +1137,127 @@ class ChromeSetupTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             module.scrape_list("Java", "上海", None, {}, "unused.json", stop_consecutive=0)
 
+    def _interrupt_at_next_page(self, module, cdp, output, page, **kwargs):
+        evaluate = cdp.eval_js
+        def interrupt(expression, sid):
+            if expression == "window.__bossScraperCheckpoint = null; void 0;" and cdp.marker:
+                raise KeyboardInterrupt
+            return evaluate(expression, sid)
+        with mock.patch.object(cdp, "eval_js", side_effect=interrupt), \
+                mock.patch.object(module.NetworkJoblistCapture, "wait_next_response", return_value=page):
+            return self._run_scrape_list(module, cdp, str(output), pages=None, **kwargs)
+
+    def test_resume_retains_streak_and_duplicates_without_navigating(self):
+        module = load_module()
+        cdp = FakeCaptureCDP()
+        with tempfile.TemporaryDirectory() as tmp:
+            output = pathlib.Path(tmp) / "jobs.json"
+            first = self._interrupt_at_next_page(module, cdp, output,
+                self._job_page(range(8), activity="8天前活跃"),
+                stop_mode="combined", stop_consecutive=2)
+            self.assertEqual(first["stop_reason"], "interrupted")
+            self.assertEqual(first["stop_streak"], 1)
+            self.assertNotIn("Target.closeTarget", cdp.sent_methods)
+            cdp.sent.clear()
+            with mock.patch.object(module.NetworkJoblistCapture, "wait_next_response", return_value=
+                                   self._job_page(list(range(8)) + [8, 9])) as capture:
+                result = self._run_scrape_list(module, cdp, str(output), pages=None,
+                    resume=first["state_file"], stop_mode="combined", stop_consecutive=2)
+            capture.assert_called_once()
+            self.assertNotIn("Page.navigate", cdp.sent_methods)
+            self.assertNotIn("Target.createTarget", cdp.sent_methods)
+            self.assertEqual(result["stop_streak"], 2)
+            self.assertEqual(result["last_page"]["combined_jobs"], 8)
+            self.assertEqual(result["total"], 10)
+            self.assertEqual(result["stop_reason"], "combined_threshold")
+            checkpoint = json.loads(pathlib.Path(first["state_file"]).read_text(encoding="utf-8"))
+            self.assertIsNone(checkpoint["pending_page"])
+            self.assertTrue(all(set(job) == set(module.EXPORT_COLUMNS) for job in checkpoint["jobs"]))
+
+    def test_resume_pending_details_retries_only_unfinished_jobs(self):
+        module = load_module()
+        cdp = FakeCaptureCDP()
+        def interrupted_details(data, max_details, **kwargs):
+            kwargs["on_update"]([dict(data["jobs"][0], job_description="original text",
+                                      capture_status="success", capture_reason="")])
+            raise KeyboardInterrupt
+        def finished_details(data, max_details, **kwargs):
+            self.assertEqual([j["title"] for j in data["jobs"]], ["b"])
+            kwargs["on_update"]([dict(data["jobs"][0], job_description="new text",
+                                      capture_status="success", capture_reason="")])
+        with tempfile.TemporaryDirectory() as tmp:
+            output = pathlib.Path(tmp) / "jobs.json"
+            with mock.patch.object(module.NetworkJoblistCapture, "wait_next_response", return_value=
+                                   self._job_page(["a", "b"], has_more=False)), \
+                    mock.patch.object(module, "scrape_details", side_effect=interrupted_details):
+                first = self._run_scrape_list(module, cdp, str(output), detail=True)
+            self.assertEqual(first["pages_completed"], 0)
+            with mock.patch.object(module.NetworkJoblistCapture, "wait_next_response") as capture, \
+                    mock.patch.object(module, "scrape_details", side_effect=finished_details):
+                result = self._run_scrape_list(module, cdp, str(output), detail=True,
+                                               resume=first["state_file"])
+            capture.assert_not_called()
+            self.assertEqual(result["stop_reason"], "end_of_results")
+            self.assertEqual(result["pages_completed"], 1)
+            self.assertEqual([j["job_description"] for j in result["jobs"]], ["original text", "new text"])
+            self.assertEqual(result["last_page"]["duplicate_jobs"], 0)
+
+    def test_resume_rejects_changed_rules_or_refreshed_document_without_writes(self):
+        module = load_module()
+        cdp = FakeCaptureCDP()
+        with tempfile.TemporaryDirectory() as tmp:
+            output = pathlib.Path(tmp) / "jobs.json"
+            first = self._interrupt_at_next_page(module, cdp, output, self._job_page([1]))
+            state_path = pathlib.Path(first["state_file"])
+            saved, exported = state_path.read_bytes(), output.read_bytes()
+            with self.assertRaisesRegex(ValueError, "参数"):
+                self._run_scrape_list(module, cdp, str(output), pages=None,
+                    resume=str(state_path), stop_threshold=10)
+            cdp.marker = None
+            with self.assertRaisesRegex(ValueError, "刷新"):
+                self._run_scrape_list(module, cdp, str(output), pages=None, resume=str(state_path))
+            self.assertEqual(state_path.read_bytes(), saved)
+            self.assertEqual(output.read_bytes(), exported)
+
+    def test_resume_cli_restores_saved_options(self):
+        module = load_module()
+        cdp = FakeCaptureCDP()
+        with tempfile.TemporaryDirectory() as tmp:
+            output = pathlib.Path(tmp) / "jobs.json"
+            first = self._interrupt_at_next_page(module, cdp, output, self._job_page([1]),
+                                                 stop_threshold=10, stop_consecutive=3)
+            with mock.patch.object(sys, "argv", ["boss", "--resume", first["state_file"]]), \
+                    mock.patch.object(module, "require_runtime_dependencies", return_value=True), \
+                    mock.patch.object(module, "resolve_city", return_value=("上海", "101020100")), \
+                    mock.patch.object(module, "scrape_list", return_value={"jobs": []}) as scrape:
+                module.main()
+            self.assertEqual(scrape.call_args.args[:3], ("Java", "上海", None))
+            self.assertEqual(scrape.call_args.kwargs["stop_threshold"], 10)
+            self.assertEqual(scrape.call_args.kwargs["stop_consecutive"], 3)
+            self.assertFalse(scrape.call_args.kwargs["detail"])
+
+    def test_checkpoint_lock_releases_and_hard_interruption_can_resume(self):
+        module = load_module()
+        cdp = FakeCaptureCDP()
+        with tempfile.TemporaryDirectory() as tmp:
+            output = pathlib.Path(tmp) / "jobs.json"
+            with module.search_state_lock(output):
+                with self.assertRaisesRegex(RuntimeError, "另一进程"):
+                    with module.search_state_lock(output):
+                        self.fail("must not obtain a concurrent lock")
+            with module.search_state_lock(output):
+                pass
+            first = self._interrupt_at_next_page(module, cdp, output, self._job_page([1]))
+            state_path = pathlib.Path(first["state_file"])
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["meta"]["stop_reason"] = ""  # Process died before its finally block.
+            module._atomic_write_json(str(state_path), state)
+            with mock.patch.object(module.NetworkJoblistCapture, "wait_next_response", return_value=
+                                   self._job_page([2], has_more=False)):
+                result = self._run_scrape_list(module, cdp, str(output), pages=None, resume=str(state_path))
+            self.assertEqual(result["total"], 2)
+            self.assertEqual(result["pages_completed"], 2)
+
     def test_eight_old_jobs_stop_after_saving_entire_page(self):
         module = load_module()
         page = self._job_page(range(15))
@@ -2427,6 +2548,7 @@ class FakeCaptureCDP:
         self.pending = list(pending_batches or [])
         self.responses = dict(responses or {})
         self.sent = []
+        self.marker = None
 
     @property
     def sent_methods(self):
@@ -2449,6 +2571,10 @@ class FakeCaptureCDP:
 
     def eval_js(self, js, sid):
         self.sent.append(("Runtime.evaluate", {"expression": js}))
+        if js == "window.__bossScraperCheckpoint":
+            return self.marker
+        if js.startswith("window.__bossScraperCheckpoint = "):
+            self.marker = json.loads(js.split(" = ", 1)[1].split(";", 1)[0])
         return None
 
     def close(self):

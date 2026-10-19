@@ -41,6 +41,7 @@ import ntpath
 from dataclasses import dataclass
 from datetime import datetime
 from collections import Counter
+from contextlib import contextmanager
 from enum import Enum
 from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
 from urllib.request import Request, urlopen
@@ -471,7 +472,7 @@ BACKGROUND_VISIBILITY_SCRIPT = (
 )
 
 
-def create_page_session(cdp, background=True):
+def create_page_session(cdp, background=True, target_id=None):
     """Create and attach an about:blank target without stealing focus by default.
 
     Background pages report themselves as hidden, which prevents BOSS detail
@@ -479,11 +480,12 @@ def create_page_session(cdp, background=True):
     before callers navigate. Interactive callers such as the login flow must
     opt into a foreground target explicitly.
     """
-    target = cdp.send(
-        "Target.createTarget",
-        {"url": "about:blank", "background": background},
-    )
-    target_id = target["result"]["targetId"]
+    if target_id is None:
+        target = cdp.send(
+            "Target.createTarget",
+            {"url": "about:blank", "background": background},
+        )
+        target_id = target["result"]["targetId"]
     attached = cdp.send(
         "Target.attachToTarget",
         {"targetId": target_id, "flatten": True},
@@ -1818,6 +1820,78 @@ def load_existing_details(input_path=None, detail_output=None, result_dir=DEFAUL
 # ============================================================
 # 抓取列表
 # ============================================================
+RESUMABLE_STOPS = {"interrupted", "connection_error", "runtime_error",
+                   "login_required", "security_check", "no_response", "response_error"}
+
+
+@contextmanager
+def search_state_lock(path):
+    """One writer per search; the OS releases the lock even after process death."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(os.fspath(path) + ".lock", "a+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            acquire = lambda: msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            release = lambda: msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            acquire = lambda: fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            release = lambda: fcntl.flock(handle, fcntl.LOCK_UN)
+        try:
+            acquire()
+        except OSError as exc:
+            raise RuntimeError("此搜索仍由另一进程运行，请先结束原进程再恢复") from exc
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            release()
+
+
+def load_search_state(path):
+    """Read the authoritative atomic checkpoint, never infer state from CSV."""
+    with open(path, encoding="utf-8") as f:
+        state = json.load(f)
+    if (not isinstance(state, dict) or state.get("schema_version") != 1
+            or not isinstance(state.get("options"), dict)
+            or not isinstance(state.get("meta"), dict)
+            or not isinstance(state.get("jobs"), list)
+            or not state.get("run_id") or not state.get("target_id")):
+        raise ValueError("无效或不支持的恢复文件")
+    ids = [j.get("job_id") for j in state["jobs"] if isinstance(j, dict)]
+    if (len(ids) != len(state["jobs"]) or not all(isinstance(i, str) and i for i in ids)
+            or len(set(ids)) != len(ids)):
+        raise ValueError("恢复文件中的岗位 ID 缺失或重复")
+    if (not isinstance(state.get("base_ids"), list)
+            or not all(isinstance(i, str) for i in state["base_ids"])
+            or any(type(state["meta"].get(k)) is not int or state["meta"][k] < 0
+                   for k in ("pages_completed", "stop_streak"))):
+        raise ValueError("恢复文件中的进度无效")
+    pending = state.get("pending_page")
+    if pending is not None:
+        if (not isinstance(pending, dict)
+                or pending.get("number") != state["meta"]["pages_completed"] + 1
+                or type(pending.get("page_start")) is not int
+                or not 0 <= pending["page_start"] <= len(ids)
+                or not isinstance(pending.get("job_ids"), list)
+                or not isinstance(pending.get("duplicate_ids"), list)
+                or not all(i in ids for i in pending["job_ids"])
+                or not all(i in pending["job_ids"] for i in pending["duplicate_ids"])
+                or type(pending.get("reached_end")) is not bool):
+            raise ValueError("恢复文件中的未完成页无效")
+    return state
+
+
+def page_marker(run_id, page):
+    """A document-local marker disappears on refresh and prevents false resumes."""
+    return {"run_id": run_id, "page": page}
+
+
 def page_stop_reason(duplicate_count, inactive_count, combined_count,
                      threshold=PAGE_STOP_THRESHOLD, mode="combined"):
     """Apply a per-page stop rule; combined_count is a union of job IDs."""
@@ -1832,35 +1906,64 @@ def page_stop_reason(duplicate_count, inactive_count, combined_count,
     return ""
 
 
-def scrape_list(keyword, city_input, max_pages, filters, output_path,
+def scrape_list(keyword, city_input, max_pages, filters, output_path, *args, **kwargs):
+    """Serialize capture/resume against the same checkpoint across processes."""
+    output_path = output_path or default_output_path("jobs")
+    state_path = kwargs.get("resume") or (os.fspath(output_path) + ".state.json")
+    with search_state_lock(state_path):
+        return _scrape_list(keyword, city_input, max_pages, filters, output_path, *args, **kwargs)
+
+
+def _scrape_list(keyword, city_input, max_pages, filters, output_path,
                 cdp_port=DEFAULT_CDP_PORT, fmt="json", allow_dom_fallback=False,
                 diff_base=None, detail=False, max_details=None, detail_output=None,
                 stop_threshold=PAGE_STOP_THRESHOLD, stop_mode="combined",
-                stop_consecutive=2):
+                stop_consecutive=2, resume=None):
     if max_pages is not None and max_pages < 1:
         raise ValueError("max_pages must be positive or None")
     page_stop_reason(0, 0, 0, stop_threshold, stop_mode)
     if stop_consecutive < 1:
         raise ValueError("stop_consecutive must be positive")
     city_name, city_code = resolve_city(city_input)
-    cdp = CDPSession(cdp_port)
     all_jobs = []
     seen = set()
     if not output_path:
         output_path = default_output_path("jobs")
+    state_path = os.path.abspath(resume or (os.fspath(output_path) + ".state.json"))
+    options = {
+        "keyword": keyword, "city": city_name, "pages": max_pages,
+        "output": os.path.abspath(output_path), "cdp_port": cdp_port, "format": fmt,
+        "allow_dom_fallback": allow_dom_fallback, "diff_base": diff_base,
+        "detail": detail, "max_details": max_details, "detail_output": detail_output,
+        "stop_threshold": stop_threshold, "stop_mode": stop_mode,
+        "stop_consecutive": stop_consecutive, **filters,
+    }
+    state = load_search_state(resume) if resume else {
+        "schema_version": 1, "run_id": os.urandom(16).hex(), "options": options,
+        "pending_page": None, "base_ids": [], "target_id": None,
+    }
+    if resume:
+        if state["options"] != options:
+            raise ValueError("恢复参数与保存时不一致；请仅使用 --resume STATE，不修改搜索或停止规则")
+        if state["meta"].get("stop_reason") not in RESUMABLE_STOPS | {""}:
+            raise ValueError("此任务已完成停止规则或页数上限；请新建搜索")
+        all_jobs = state["jobs"]
+        seen = {job["job_id"] for job in all_jobs}
 
     # 选定 is_new 对比基准(#88):显式 --diff-base 优先,否则按规则自动选取
-    if diff_base is None:
+    if resume:
+        base_ids = set(state["base_ids"])
+    elif diff_base is None:
         diff_base = find_diff_base(
             os.path.dirname(output_path) or DEFAULT_RESULT_DIR, keyword, city_name
         )
-    if diff_base:
+    if not resume and diff_base:
         base_ids = load_base_ids(diff_base)
         base_dt = parse_result_file_time(diff_base)
         base_desc = base_dt.strftime("%Y-%m-%d %H:%M") if base_dt else "指定文件"
         print(f"📌 对比基准: {os.path.basename(diff_base)}({base_desc} 抓取),"
               f"其中已见 {len(base_ids)} 条")
-    else:
+    elif not resume:
         base_ids = set()
         print("📌 无同关键词历史基准,本次全部视为新增(is_new=true)")
 
@@ -1903,9 +2006,17 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
         "stop_threshold": stop_threshold, "stop_mode": stop_mode,
         "stop_consecutive": stop_consecutive, "stop_streak": 0,
     }
+    if resume:
+        meta = dict(state["meta"], stop_reason="")
+    meta["state_file"] = state_path
+    state["base_ids"] = sorted(base_ids)
+    for job in all_jobs:
+        job["is_new"] = job["job_id"] not in base_ids
 
     def save_progress():
         exported = [export_job_record(job) for job in all_jobs]
+        state.update(meta=dict(meta), jobs=exported)
+        _atomic_write_json(state_path, state)
         payload = dict(meta, total=len(exported), jobs=exported,
                        scraped_at=datetime.now().isoformat())
         _atomic_write_json(output_path, payload)
@@ -1916,7 +2027,9 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
             if fmt == "csv":
                 write_detail_csv(os.path.splitext(detail_output)[0] + ".csv", all_jobs)
 
-    tid, sid = create_page_session(cdp)
+    cdp = CDPSession(cdp_port)
+    tid = sid = None
+    validated = not resume
 
     def human_scroll(cdp, sid, to_bottom=False):
         """模拟人类滚动: 随机次数、随机距离、随机停顿，偶尔回滚一点。
@@ -1976,16 +2089,39 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
         )
 
     try:
+        try:
+            tid, sid = create_page_session(cdp, target_id=state["target_id"] if resume else None)
+        except KeyError as exc:
+            raise ValueError("无法连接原搜索标签页；请保持 Chrome 与原标签页打开") from exc
+        if resume:
+            expected_page = (state["pending_page"] or {}).get("number", meta["pages_completed"])
+            marker = cdp.eval_js("window.__bossScraperCheckpoint", sid)
+            if marker != page_marker(state["run_id"], expected_page):
+                raise ValueError("原搜索标签页已刷新、跳转或翻页未完成，无法原位恢复；已保存数据不变")
+        validated = True
+        state["target_id"] = tid
         # capture 的创建与 enable 放进 try 内：CDP 传输层异常走统一的优雅退出，
         # 原先 enable 位于 try 外，任何异常都会裸崩且跳过 finally 清理（#78）
         capture = NetworkJoblistCapture(cdp, sid)
         capture.enable()
-        pg = 0
-        while max_pages is None or pg < max_pages:
-            pg += 1
+        pg = meta["pages_completed"]
+        while state["pending_page"] or max_pages is None or pg < max_pages:
+            pending = state["pending_page"]
+            pg = pending["number"] if pending else pg + 1
             print(f"--- [{pg}/{max_pages or '自动'} 页, {len(all_jobs)} 条已抓] ---")
 
-            if pg == 1:
+            if pending:
+                records_by_id = {job["job_id"]: job for job in all_jobs}
+                jobs = [records_by_id[job_id] for job_id in pending["job_ids"]]
+                reached_end = pending["reached_end"]
+                page_start = pending["page_start"]
+                duplicate_ids = set(pending["duplicate_ids"])
+                duplicate_count = sum(job["job_id"] in duplicate_ids for job in jobs)
+            else:
+                # If interrupted during a scroll, do not pretend the previous
+                # checkpoint still describes the live document's page position.
+                cdp.eval_js("window.__bossScraperCheckpoint = null; void 0;", sid)
+            if not pending and pg == 1:
                 # 导航真实搜索页，被动等待页面自己发出首个 joblist 请求
                 url = build_search_url(keyword, city_code, pg, filters)
 
@@ -2002,7 +2138,7 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                     log.warning("⚠️ 未捕获到页面自身的搜索响应")
                 else:
                     gate_response(data, first=True)
-            else:
+            elif not pending:
                 # 翻页：滚动到底触发无限滚动加载，继续旁听页面自身请求
                 human_scroll(cdp, sid, to_bottom=True)
                 data = capture.wait_next_response(timeout=20)
@@ -2010,15 +2146,16 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 if data is not None:
                     gate_response(data)
 
-            reached_end = (
-                isinstance(data, dict)
-                and (data.get("zpData") or {}).get("hasMore") is False
-            )
+            if not pending:
+                reached_end = (
+                    isinstance(data, dict)
+                    and (data.get("zpData") or {}).get("hasMore") is False
+                )
 
-            jobs = map_api_jobs(data) if data is not None else []
+                jobs = map_api_jobs(data) if data is not None else []
 
             # DOM 提取的薪资可能是加密字体，默认禁用；只有显式允许时才降级。
-            if not jobs and allow_dom_fallback:
+            if not pending and not jobs and allow_dom_fallback:
                 log.warning("⚠️ 未捕获到 API 职位数据，回退到 DOM 提取（此方式已弃用，数据可能不完整）")
                 if data is None:
                     time.sleep(random.uniform(2, 4))
@@ -2033,7 +2170,7 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
             elif not jobs:
                 log.warning("⚠️ 未捕获到职位数据，已跳过 DOM fallback；如需强制降级可加 --allow-dom-fallback")
 
-            if pg == 1:
+            if pg == 1 and not pending:
                 human_mouse_jitter(cdp, sid)
 
             if not jobs:
@@ -2043,10 +2180,11 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 print(f"  无数据，停止此城市搜索（{meta['stop_reason']}）。")
                 break
 
-            page_start = len(all_jobs)
-            # Count against previous pages before deduplicating the current page.
-            duplicate_ids = {ensure_job_id(job) for job in jobs} & seen
-            duplicate_count = sum(job["job_id"] in duplicate_ids for job in jobs)
+            if not pending:
+                page_start = len(all_jobs)
+                # Count against previous pages before deduplicating the current page.
+                duplicate_ids = {ensure_job_id(job) for job in jobs} & seen
+                duplicate_count = sum(job["job_id"] in duplicate_ids for job in jobs)
             new = 0
             for j in jobs:
                 if j["job_id"] in seen:
@@ -2066,23 +2204,43 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 print(f"  ✓ {marker}{j['title']} | {salary} | {j.get('location','')} | {j.get('boss_name','')}{extra}")
 
             print(f"  本页 {len(jobs)} 条, 新增 {new}, 累计 {len(all_jobs)}")
+            if not pending:
+                state["pending_page"] = {
+                    "number": pg, "job_ids": [job["job_id"] for job in jobs],
+                    "duplicate_ids": sorted(duplicate_ids), "page_start": page_start,
+                    "reached_end": reached_end,
+                }
+                marker_json = json.dumps(page_marker(state["run_id"], pg))
+                cdp.eval_js(f"window.__bossScraperCheckpoint = {marker_json}; void 0;", sid)
+                save_progress()
 
-            if detail and new:
+            if detail and all_jobs[page_start:]:
                 # A page is processed before the next scroll. Keep earlier pages
                 # in every snapshot, including saves made during detail capture.
                 def update_page(records):
-                    all_jobs[page_start:] = records
+                    updates = {job["job_id"]: job for job in records}
+                    all_jobs[page_start:] = [updates.get(job["job_id"], job)
+                                             for job in all_jobs[page_start:]]
                     save_progress()
 
-                remaining = None if max_details is None else max(0, max_details - page_start)
+                unfinished = [job for job in all_jobs[page_start:]
+                              if job.get("capture_status") != "success"]
+                finished = len(all_jobs[page_start:]) - len(unfinished)
+                remaining = None if max_details is None else max(0, max_details - page_start - finished)
                 scrape_details(
-                    dict(meta, jobs=all_jobs[page_start:]), remaining,
+                    dict(meta, jobs=unfinished), remaining,
                     cdp_port=cdp_port, fmt=fmt, on_update=update_page,
                 )
             else:
                 for job in all_jobs[page_start:]:
                     job.setdefault("capture_status", "not_attempted")
                     job.setdefault("capture_reason", "no_detail")
+            stop_reasons = {job.get("capture_reason") for job in all_jobs[page_start:]}
+            gate = next((reason for reason in ("security_check", "login_required", "interrupted")
+                         if reason in stop_reasons), "")
+            if gate:
+                meta["stop_reason"] = gate
+                break  # Keep pending_page: finish this page's details on resume.
             records_by_id = {job["job_id"]: job for job in all_jobs}
             inactive_ids = {
                 job["job_id"] for job in jobs if is_inactive_over_seven_days(
@@ -2092,6 +2250,7 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
             inactive_count = sum(job["job_id"] in inactive_ids for job in jobs)
             combined_count = len(duplicate_ids | inactive_ids)
             meta["pages_completed"] = pg
+            state["pending_page"] = None
             meta["last_page"] = {
                 "total": len(jobs), "duplicate_jobs": duplicate_count,
                 "inactive_jobs": inactive_count,
@@ -2102,12 +2261,7 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 duplicate_count, inactive_count, combined_count, stop_threshold, stop_mode,
             )
             meta["stop_streak"] = meta["stop_streak"] + 1 if threshold_reason else 0
-            stop_reasons = {job.get("capture_reason") for job in all_jobs[page_start:]}
-            gate = next((reason for reason in ("security_check", "login_required", "interrupted")
-                         if reason in stop_reasons), "")
-            if gate:
-                meta["stop_reason"] = gate
-            elif threshold_reason and meta["stop_streak"] >= stop_consecutive:
+            if threshold_reason and meta["stop_streak"] >= stop_consecutive:
                 meta["stop_reason"] = threshold_reason
             elif reached_end:
                 meta["stop_reason"] = "end_of_results"
@@ -2137,10 +2291,14 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
         print(f"\n⚠️ {e}")
     finally:
         try:
-            save_progress()
+            if validated:
+                save_progress()
         finally:
             try:
-                cdp.send("Target.closeTarget", {"targetId": tid})
+                retain_target = (meta["stop_reason"] in RESUMABLE_STOPS
+                                 and (meta["pages_completed"] > 0 or state["pending_page"]))
+                if validated and tid and not retain_target:
+                    cdp.send("Target.closeTarget", {"targetId": tid})
             except CDP_TRANSIENT_EXCEPTIONS + (OSError, RuntimeError) as exc:
                 log.warning(f"列表标签页关闭失败: {exc}")
             finally:
@@ -3074,6 +3232,7 @@ def main():
                    help="separate：各条件分别达到阈值；combined：按 job_id 合并去重后达到阈值")
     p.add_argument("--stop-consecutive", type=int, default=2,
                    help="连续多少页达到阈值才停止（默认 2；未达标页清零）")
+    p.add_argument("--resume", metavar="STATE", help="从 .state.json 恢复原标签页和搜索参数")
     p.add_argument("--output", default=None, help="列表数据输出路径")
     p.add_argument("--diff-base", default=None, help="is_new 对比基准文件(默认自动取同关键词同城市、日期早于本轮的最近一份结果)")
     p.add_argument("--detail-output", default=None, help="可选：额外保存独立详情文件（默认详情直接写入 --output）")
@@ -3133,6 +3292,15 @@ def main():
                    help="抓取正常结束后自动关闭专用 Chrome（默认不关；异常退出不触发，保留登录态）")
 
     args = p.parse_args()
+    if args.resume:
+        try:
+            saved = load_search_state(args.resume)
+        except (OSError, ValueError) as exc:
+            p.error(str(exc))
+        if args.input or args.merge:
+            p.error("--resume 不能与 --input / --merge 同用")
+        p.set_defaults(**saved["options"])
+        args = p.parse_args()
     if args.pages is not None and args.pages < 1:
         p.error("--pages 必须大于零")
     if args.stop_threshold < 1:
@@ -3215,8 +3383,9 @@ def main():
                 max_details=args.max_details, detail_output=args.detail_output,
                 stop_threshold=args.stop_threshold, stop_mode=args.stop_mode,
                 stop_consecutive=args.stop_consecutive,
+                resume=args.resume,
             )
-        except LoginGateError as e:
+        except (LoginGateError, ValueError, OSError, RuntimeError) as e:
             print(str(e))
             sys.exit(1)
 

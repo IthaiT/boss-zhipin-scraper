@@ -61,3 +61,5 @@ python scripts/boss_cdp_raw.py --smoke-test
 ```
 
 By default, **2 consecutive pages** must reach the threshold; a non-qualifying page resets the streak. Use `--stop-consecutive 1` for single-page stopping, or e.g. `--stop-threshold 10 --stop-consecutive 2`. End of results, verification, and connection errors still save and stop immediately. JSON metadata includes `stop_streak` and `stop_consecutive`.
+
+After interruption use `python scripts/boss_cdp_raw.py --resume jobs.json.state.json`. Each save atomically updates the checkpoint with search options, seen IDs, original text, stop streak, and pending page. Successful details are reused. Keep Chrome and the original search tab open; recoverable stops retain that tab. Refreshing, navigating, or closing the tab, restarting Chrome, or interrupting a scroll prevents in-place resume; existing files remain available for a new search with a new output. Completed threshold/end/page-limit stops cannot resume. Do not change search or stop options when resuming. The checkpoint is authoritative; JSON/CSV exports can be regenerated.

@@ -65,3 +65,4 @@ validation_*/
 # Complete CSV snapshots waiting for a reader lock to be released
 *.csv.pending
 *.csv.tmp*
+*.state.json.lock

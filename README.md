@@ -61,3 +61,5 @@ python scripts/boss_cdp_raw.py --smoke-test
 ```
 
 默认还需连续 **2 页** 达到阈值才停止，任一未达标页将连续次数清零。`--stop-consecutive 1` 可恢复单页触发；例如 `--stop-threshold 10 --stop-consecutive 2`。无更多结果、验证、连接异常等仍立即保存并停止，不等待连续达标。JSON 顶层保存 `stop_streak` 和 `stop_consecutive`。
+
+中断后使用 `python scripts/boss_cdp_raw.py --resume jobs.json.state.json`。每次保存同时原子更新 `.state.json`，恢复搜索参数、已见 ID、累计原文、连续达标次数及未完成页；成功详情不重复访问。保持 Chrome 和原搜索标签页打开，脚本在可恢复停止时保留标签页。原标签页刷新、跳转、关闭、Chrome 重启或中断恰好发生在翻页中时，拒绝假装恢复并保留已有文件；可另建输出重新搜索。已达停止阈值、结果末尾或页数上限的任务不续跑。恢复时不要更改搜索和停止参数；检查点是恢复依据，JSON/CSV 是可重新生成的导出快照。
