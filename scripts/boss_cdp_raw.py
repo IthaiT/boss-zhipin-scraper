@@ -1835,10 +1835,13 @@ def page_stop_reason(duplicate_count, inactive_count, combined_count,
 def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 cdp_port=DEFAULT_CDP_PORT, fmt="json", allow_dom_fallback=False,
                 diff_base=None, detail=False, max_details=None, detail_output=None,
-                stop_threshold=PAGE_STOP_THRESHOLD, stop_mode="combined"):
+                stop_threshold=PAGE_STOP_THRESHOLD, stop_mode="combined",
+                stop_consecutive=2):
     if max_pages is not None and max_pages < 1:
         raise ValueError("max_pages must be positive or None")
     page_stop_reason(0, 0, 0, stop_threshold, stop_mode)
+    if stop_consecutive < 1:
+        raise ValueError("stop_consecutive must be positive")
     city_name, city_code = resolve_city(city_input)
     cdp = CDPSession(cdp_port)
     all_jobs = []
@@ -1898,6 +1901,7 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
         "keyword": keyword, "city": city_name, "filters": filters,
         "filter_desc": filter_desc, "pages_completed": 0, "stop_reason": "",
         "stop_threshold": stop_threshold, "stop_mode": stop_mode,
+        "stop_consecutive": stop_consecutive, "stop_streak": 0,
     }
 
     def save_progress():
@@ -2097,12 +2101,13 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
             threshold_reason = page_stop_reason(
                 duplicate_count, inactive_count, combined_count, stop_threshold, stop_mode,
             )
+            meta["stop_streak"] = meta["stop_streak"] + 1 if threshold_reason else 0
             stop_reasons = {job.get("capture_reason") for job in all_jobs[page_start:]}
             gate = next((reason for reason in ("security_check", "login_required", "interrupted")
                          if reason in stop_reasons), "")
             if gate:
                 meta["stop_reason"] = gate
-            elif threshold_reason:
+            elif threshold_reason and meta["stop_streak"] >= stop_consecutive:
                 meta["stop_reason"] = threshold_reason
             elif reached_end:
                 meta["stop_reason"] = "end_of_results"
@@ -2110,7 +2115,8 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 meta["stop_reason"] = "page_limit"
             save_progress()
             print(f"  本页重复 {duplicate_count} 条，超过 7 天未活跃 {inactive_count} 条"
-                  f"（{stop_mode}，阈值 {stop_threshold} 条，合并去重 {combined_count} 条）。")
+                  f"（{stop_mode}，阈值 {stop_threshold} 条，合并去重 {combined_count} 条，"
+                  f"连续达标 {meta['stop_streak']}/{stop_consecutive} 页）。")
             if meta["stop_reason"]:
                 print(f"  停止此城市搜索：{meta['stop_reason']}。已保存本页所有新岗位。\n")
                 break
@@ -3066,6 +3072,8 @@ def main():
                    help="每页停止阈值，达到即停止（默认 8；超过 10 应传 11）")
     p.add_argument("--stop-mode", choices=["separate", "combined"], default="combined",
                    help="separate：各条件分别达到阈值；combined：按 job_id 合并去重后达到阈值")
+    p.add_argument("--stop-consecutive", type=int, default=2,
+                   help="连续多少页达到阈值才停止（默认 2；未达标页清零）")
     p.add_argument("--output", default=None, help="列表数据输出路径")
     p.add_argument("--diff-base", default=None, help="is_new 对比基准文件(默认自动取同关键词同城市、日期早于本轮的最近一份结果)")
     p.add_argument("--detail-output", default=None, help="可选：额外保存独立详情文件（默认详情直接写入 --output）")
@@ -3129,6 +3137,8 @@ def main():
         p.error("--pages 必须大于零")
     if args.stop_threshold < 1:
         p.error("--stop-threshold 必须大于零")
+    if args.stop_consecutive < 1:
+        p.error("--stop-consecutive 必须大于零")
     if args.max_details is not None and args.max_details < 0:
         p.error("--max-details 不能为负数")
 
@@ -3204,6 +3214,7 @@ def main():
                 diff_base=args.diff_base, detail=args.detail,
                 max_details=args.max_details, detail_output=args.detail_output,
                 stop_threshold=args.stop_threshold, stop_mode=args.stop_mode,
+                stop_consecutive=args.stop_consecutive,
             )
         except LoginGateError as e:
             print(str(e))

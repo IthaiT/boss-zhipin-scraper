@@ -59,3 +59,5 @@ CSV 先写完整快照，再原子替换，读取时不会看到半截文件；�
 python -m unittest tests.test_chrome_setup tests.test_job_summary
 python scripts/boss_cdp_raw.py --smoke-test
 ```
+
+默认还需连续 **2 页** 达到阈值才停止，任一未达标页将连续次数清零。`--stop-consecutive 1` 可恢复单页触发；例如 `--stop-threshold 10 --stop-consecutive 2`。无更多结果、验证、连接异常等仍立即保存并停止，不等待连续达标。JSON 顶层保存 `stop_streak` 和 `stop_consecutive`。

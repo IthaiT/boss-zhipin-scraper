@@ -69,3 +69,5 @@ CSV 使用 UTF-8 BOM，所有 32 列固定存在；数组以 JSON 字符串保�
 - `--max-details N` 只在用户明确限制或必要的开发测试时使用，未处理项仍保留；`--no-detail` 仅抓列表；`--detail-output` 可额外输出同样 32 字段的详情副本。
 - `--allow-dom-fallback` 默认关闭，DOM 薪资可能受字体影响。`--copy-login-state` 仅在用户明确要求时使用；`--reset-chrome-profile` 会清除专用登录态，不用于普通重启。
 - 抓取结束默认保留浏览器；用户要求关闭时可用 `--stop-chrome` / `--stop-edge`，仅影响专用 profile。
+
+默认连续 2 页达标才停止；`--stop-consecutive N` 可调整，未达标页清零。无更多结果、验证和异常仍立即停止。

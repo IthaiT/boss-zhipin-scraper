@@ -59,3 +59,5 @@ An explicit `--pages N` sets an optional page cap, including values above 10; om
 python -m unittest tests.test_chrome_setup tests.test_job_summary
 python scripts/boss_cdp_raw.py --smoke-test
 ```
+
+By default, **2 consecutive pages** must reach the threshold; a non-qualifying page resets the streak. Use `--stop-consecutive 1` for single-page stopping, or e.g. `--stop-threshold 10 --stop-consecutive 2`. End of results, verification, and connection errors still save and stop immediately. JSON metadata includes `stop_streak` and `stop_consecutive`.

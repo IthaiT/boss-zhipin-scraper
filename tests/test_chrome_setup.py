@@ -947,6 +947,7 @@ class ChromeSetupTests(unittest.TestCase):
         """
         module._request_counter = 0
         kwargs.setdefault("stop_mode", "separate")
+        kwargs.setdefault("stop_consecutive", 1)
         with mock.patch.object(module, "CDPSession", lambda port=9222: cdp), \
                 mock.patch.object(module, "resolve_city", return_value=("上海", "101020100")), \
                 mock.patch("time.sleep", lambda s: None), \
@@ -1112,6 +1113,30 @@ class ChromeSetupTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 module.page_stop_reason(0, 0, 0, threshold, mode)
 
+    def test_consecutive_threshold_resets_and_saves_triggering_page(self):
+        module = load_module()
+        pages = [self._job_page(range(n, n + size), activity=activity)
+                 for n, size, activity in [(0, 8, "8天前活跃"), (10, 1, "在线"),
+                                           (20, 8, "8天前活跃"), (30, 8, "8天前活跃")]]
+        with tempfile.TemporaryDirectory() as tmp:
+            result, calls = self._scrape_responses(module, pathlib.Path(tmp) / "jobs.json", pages,
+                                                  stop_mode="combined", stop_consecutive=2)
+        self.assertEqual(calls, 4)
+        self.assertEqual(result["total"], 25)
+        self.assertEqual(result["stop_streak"], 2)
+        self.assertEqual(result["stop_reason"], "combined_threshold")
+
+    def test_end_of_results_does_not_wait_for_streak(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            result, calls = self._scrape_responses(module, pathlib.Path(tmp) / "jobs.json", [
+                self._job_page(range(8), has_more=False, activity="8天前活跃")], stop_consecutive=2)
+        self.assertEqual(calls, 1)
+        self.assertEqual(result["stop_streak"], 1)
+        self.assertEqual(result["stop_reason"], "end_of_results")
+        with self.assertRaises(ValueError):
+            module.scrape_list("Java", "上海", None, {}, "unused.json", stop_consecutive=0)
+
     def test_eight_old_jobs_stop_after_saving_entire_page(self):
         module = load_module()
         page = self._job_page(range(15))
@@ -1258,6 +1283,7 @@ class ChromeSetupTests(unittest.TestCase):
                 self.assertEqual(scrape.call_args.args[2], expected)
                 self.assertTrue(scrape.call_args.kwargs["detail"])
                 self.assertEqual(scrape.call_args.kwargs["stop_mode"], "combined")
+                self.assertEqual(scrape.call_args.kwargs["stop_consecutive"], 2)
 
     def test_merge_preserves_fresh_page_details_over_older_rows(self):
         module = load_module()
