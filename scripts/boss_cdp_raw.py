@@ -781,10 +781,13 @@ def map_list_boss_active_status(job):
 def is_inactive_over_seven_days(status):
     """Recognize older activity buckets; missing/ambiguous labels stay unknown."""
     status = re.sub(r"\s+", "", str(status or ""))
-    if status in {"本月活跃", "月内活跃", "一个月内活跃", "近一个月活跃",
-                  "半月内活跃", "半个月内活跃", "半年前活跃", "很久未活跃",
+    if status in {"半年前活跃", "很久未活跃",
                   "长期未活跃", "很久没活跃"}:
         return True
+    # A broad upper bound (e.g. active within 30 days) does not establish that
+    # the last activity was more than seven days ago.
+    if "内" in status or status == "本月活跃":
+        return False
     match = re.fullmatch(
         r"(?:近)?(\d+|[一二两三四五六七八九十]+)(分钟|小时|天|日|周|个月|月|年)(?:内|前)?活跃",
         status,
@@ -1815,11 +1818,27 @@ def load_existing_details(input_path=None, detail_output=None, result_dir=DEFAUL
 # ============================================================
 # 抓取列表
 # ============================================================
+def page_stop_reason(duplicate_count, inactive_count, combined_count,
+                     threshold=PAGE_STOP_THRESHOLD, mode="combined"):
+    """Apply a per-page stop rule; combined_count is a union of job IDs."""
+    if threshold < 1 or mode not in {"separate", "combined"}:
+        raise ValueError("stop threshold must be positive and mode separate or combined")
+    if mode == "combined":
+        return "combined_threshold" if combined_count >= threshold else ""
+    for count, reason in ((duplicate_count, "duplicate_threshold"),
+                          (inactive_count, "inactive_threshold")):
+        if count >= threshold:
+            return reason
+    return ""
+
+
 def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 cdp_port=DEFAULT_CDP_PORT, fmt="json", allow_dom_fallback=False,
-                diff_base=None, detail=False, max_details=None, detail_output=None):
+                diff_base=None, detail=False, max_details=None, detail_output=None,
+                stop_threshold=PAGE_STOP_THRESHOLD, stop_mode="combined"):
     if max_pages is not None and max_pages < 1:
         raise ValueError("max_pages must be positive or None")
+    page_stop_reason(0, 0, 0, stop_threshold, stop_mode)
     city_name, city_code = resolve_city(city_input)
     cdp = CDPSession(cdp_port)
     all_jobs = []
@@ -1878,6 +1897,7 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
     meta = {
         "keyword": keyword, "city": city_name, "filters": filters,
         "filter_desc": filter_desc, "pages_completed": 0, "stop_reason": "",
+        "stop_threshold": stop_threshold, "stop_mode": stop_mode,
     }
 
     def save_progress():
@@ -2021,7 +2041,8 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
 
             page_start = len(all_jobs)
             # Count against previous pages before deduplicating the current page.
-            duplicate_count = sum(ensure_job_id(job) in seen for job in jobs)
+            duplicate_ids = {ensure_job_id(job) for job in jobs} & seen
+            duplicate_count = sum(job["job_id"] in duplicate_ids for job in jobs)
             new = 0
             for j in jobs:
                 if j["job_id"] in seen:
@@ -2059,32 +2080,37 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                     job.setdefault("capture_status", "not_attempted")
                     job.setdefault("capture_reason", "no_detail")
             records_by_id = {job["job_id"]: job for job in all_jobs}
-            inactive_count = sum(
-                is_inactive_over_seven_days(
+            inactive_ids = {
+                job["job_id"] for job in jobs if is_inactive_over_seven_days(
                     export_job_record(records_by_id[job["job_id"]])["boss_active_status"]
-                ) for job in jobs
-            )
+                )
+            }
+            inactive_count = sum(job["job_id"] in inactive_ids for job in jobs)
+            combined_count = len(duplicate_ids | inactive_ids)
             meta["pages_completed"] = pg
             meta["last_page"] = {
                 "total": len(jobs), "duplicate_jobs": duplicate_count,
                 "inactive_jobs": inactive_count,
             }
+            if stop_mode == "combined":
+                meta["last_page"].update(combined_jobs=combined_count)
+            threshold_reason = page_stop_reason(
+                duplicate_count, inactive_count, combined_count, stop_threshold, stop_mode,
+            )
             stop_reasons = {job.get("capture_reason") for job in all_jobs[page_start:]}
             gate = next((reason for reason in ("security_check", "login_required", "interrupted")
                          if reason in stop_reasons), "")
             if gate:
                 meta["stop_reason"] = gate
-            elif duplicate_count >= PAGE_STOP_THRESHOLD:
-                meta["stop_reason"] = "duplicate_threshold"
-            elif inactive_count >= PAGE_STOP_THRESHOLD:
-                meta["stop_reason"] = "inactive_threshold"
+            elif threshold_reason:
+                meta["stop_reason"] = threshold_reason
             elif reached_end:
                 meta["stop_reason"] = "end_of_results"
             elif max_pages is not None and pg >= max_pages:
                 meta["stop_reason"] = "page_limit"
             save_progress()
             print(f"  本页重复 {duplicate_count} 条，超过 7 天未活跃 {inactive_count} 条"
-                  f"（停止阈值均为 {PAGE_STOP_THRESHOLD} 条）。")
+                  f"（{stop_mode}，阈值 {stop_threshold} 条，合并去重 {combined_count} 条）。")
             if meta["stop_reason"]:
                 print(f"  停止此城市搜索：{meta['stop_reason']}。已保存本页所有新岗位。\n")
                 break
@@ -3036,6 +3062,10 @@ def main():
     p.add_argument("--keyword", default="AI Agent", help="搜索关键词")
     p.add_argument("--city", default=DEFAULT_CITY_INPUT, help=f"城市 (中文名或代码，默认 {DEFAULT_CITY_INPUT})")
     p.add_argument("--pages", type=int, default=None, help="可选页数上限；默认按活跃状态/重复岗位自动停止")
+    p.add_argument("--stop-threshold", type=int, default=PAGE_STOP_THRESHOLD,
+                   help="每页停止阈值，达到即停止（默认 8；超过 10 应传 11）")
+    p.add_argument("--stop-mode", choices=["separate", "combined"], default="combined",
+                   help="separate：各条件分别达到阈值；combined：按 job_id 合并去重后达到阈值")
     p.add_argument("--output", default=None, help="列表数据输出路径")
     p.add_argument("--diff-base", default=None, help="is_new 对比基准文件(默认自动取同关键词同城市、日期早于本轮的最近一份结果)")
     p.add_argument("--detail-output", default=None, help="可选：额外保存独立详情文件（默认详情直接写入 --output）")
@@ -3097,6 +3127,8 @@ def main():
     args = p.parse_args()
     if args.pages is not None and args.pages < 1:
         p.error("--pages 必须大于零")
+    if args.stop_threshold < 1:
+        p.error("--stop-threshold 必须大于零")
     if args.max_details is not None and args.max_details < 0:
         p.error("--max-details 不能为负数")
 
@@ -3171,6 +3203,7 @@ def main():
                 allow_dom_fallback=args.allow_dom_fallback,
                 diff_base=args.diff_base, detail=args.detail,
                 max_details=args.max_details, detail_output=args.detail_output,
+                stop_threshold=args.stop_threshold, stop_mode=args.stop_mode,
             )
         except LoginGateError as e:
             print(str(e))

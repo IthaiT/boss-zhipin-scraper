@@ -946,6 +946,7 @@ class ChromeSetupTests(unittest.TestCase):
         返回新模块对象，异常类/全局计数器不能跨实例比较）。
         """
         module._request_counter = 0
+        kwargs.setdefault("stop_mode", "separate")
         with mock.patch.object(module, "CDPSession", lambda port=9222: cdp), \
                 mock.patch.object(module, "resolve_city", return_value=("上海", "101020100")), \
                 mock.patch("time.sleep", lambda s: None), \
@@ -1073,11 +1074,49 @@ class ChromeSetupTests(unittest.TestCase):
             result = self._run_scrape_list(module, cdp, str(output), pages=limit, **kwargs)
         return result, capture.call_count
 
+    def test_combined_rule_counts_overlapping_conditions_once(self):
+        module = load_module()
+        first = self._job_page(range(6), activity="8天前活跃")
+        second = self._job_page(list(range(4)) + list(range(6, 9)))
+        for job in second["zpData"]["jobList"][:2] + second["zpData"]["jobList"][4:]:
+            job["activeTimeDesc"] = "8天前活跃"
+        with tempfile.TemporaryDirectory() as tmp:
+            result, calls = self._scrape_responses(module, pathlib.Path(tmp) / "jobs.json", [first, second],
+                                                  stop_mode="combined", stop_threshold=7)
+        self.assertEqual(calls, 2)
+        self.assertEqual(result["last_page"]["duplicate_jobs"], 4)
+        self.assertEqual(result["last_page"]["inactive_jobs"], 7)
+        self.assertEqual(result["last_page"]["combined_jobs"], 7)
+        self.assertEqual(result["stop_reason"], "combined_threshold")
+
+    def test_combined_rule_does_not_add_counts_for_same_job(self):
+        module = load_module()
+        pages = [self._job_page(range(7), activity="8天前活跃"), self._job_page(range(7)),
+                 self._job_page(["last"], has_more=False)]
+        with tempfile.TemporaryDirectory() as tmp:
+            result, calls = self._scrape_responses(module, pathlib.Path(tmp) / "jobs.json", pages,
+                                                  stop_mode="combined", stop_threshold=11)
+        self.assertEqual(calls, 3)
+        self.assertEqual(result["stop_reason"], "end_of_results")
+        self.assertEqual(result["total"], 8)
+
+    def test_configurable_threshold_stops_at_requested_boundary(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            result, calls = self._scrape_responses(module, pathlib.Path(tmp) / "jobs.json", [
+                self._job_page(range(10), activity="8天前活跃"),
+                self._job_page(range(10, 21), activity="8天前活跃")], stop_threshold=11)
+        self.assertEqual(calls, 2)
+        self.assertEqual(result["stop_reason"], "inactive_threshold")
+        for threshold, mode in ((0, "separate"), (1, "bad")):
+            with self.assertRaises(ValueError):
+                module.page_stop_reason(0, 0, 0, threshold, mode)
+
     def test_eight_old_jobs_stop_after_saving_entire_page(self):
         module = load_module()
         page = self._job_page(range(15))
         for job in page["zpData"]["jobList"][:8]:
-            job["activeTimeDesc"] = "30日内活跃"
+            job["activeTimeDesc"] = "8天前活跃"
         with tempfile.TemporaryDirectory() as tmp:
             output = pathlib.Path(tmp) / "jobs.json"
             result, calls = self._scrape_responses(module, output, [page], fmt="csv")
@@ -1094,7 +1133,7 @@ class ChromeSetupTests(unittest.TestCase):
         module = load_module()
         page = self._job_page(range(15), activity="")
         for job in page["zpData"]["jobList"][:7]:
-            job["activeTimeDesc"] = "30日内活跃"
+            job["activeTimeDesc"] = "8天前活跃"
         with tempfile.TemporaryDirectory() as tmp:
             result, calls = self._scrape_responses(module, pathlib.Path(tmp) / "jobs.json", [
                 page, self._job_page(["last"], has_more=False)])
@@ -1176,7 +1215,7 @@ class ChromeSetupTests(unittest.TestCase):
             for job in data["jobs"]:
                 visited.append(job["job_id"])
                 records.append(dict(job, capture_status="success", capture_reason="",
-                                    raw_detail={"boss_active_status": "30日内活跃"}))
+                                    raw_detail={"boss_active_status": "8天前活跃"}))
             kwargs["on_update"](records)
             return records
 
@@ -1192,10 +1231,10 @@ class ChromeSetupTests(unittest.TestCase):
 
     def test_activity_buckets_and_job_identity_are_stable(self):
         module = load_module()
-        for status in ("8天前活跃", "30日内活跃", "两周内活跃", "本月活跃", "1个月前活跃", "很久未活跃"):
+        for status in ("8天前活跃", "两周前活跃", "1个月前活跃", "很久未活跃"):
             with self.subTest(status=status):
                 self.assertTrue(module.is_inactive_over_seven_days(status))
-        for status in ("", None, "在线", "刚刚活跃", "昨日活跃", "7日内活跃", "一周内活跃", "近期活跃", "离线"):
+        for status in ("", None, "在线", "刚刚活跃", "昨日活跃", "7日内活跃", "一周内活跃", "近期活跃", "离线", "30日内活跃", "两周内活跃", "本月活跃"):
             with self.subTest(status=status):
                 self.assertFalse(module.is_inactive_over_seven_days(status))
         one = {"job_link": "https://www.zhipin.com/job_detail/one.html?lid=1"}
@@ -1218,6 +1257,7 @@ class ChromeSetupTests(unittest.TestCase):
                     module.main()
                 self.assertEqual(scrape.call_args.args[2], expected)
                 self.assertTrue(scrape.call_args.kwargs["detail"])
+                self.assertEqual(scrape.call_args.kwargs["stop_mode"], "combined")
 
     def test_merge_preserves_fresh_page_details_over_older_rows(self):
         module = load_module()

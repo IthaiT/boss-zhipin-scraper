@@ -47,12 +47,11 @@ CSV snapshots are written completely before atomic replacement, so readers see a
 
 The dedicated persistent profile is `~/.boss-zhipin-scraper/chrome-profile`; main-browser data is not copied by default. Use `--copy-login-state` only when explicitly requested. `--reset-chrome-profile` clears the dedicated login; `--stop-chrome` / `--stop-edge` close only the dedicated profile. Default result directory: `~/.boss-zhipin-scraper/job-result/`.
 
-There is no default fixed page or total-request cap; existing request intervals remain. After each page, either condition stops the current city:
+There is no default fixed page or total-request cap; existing intervals remain. Each page counts the union of job IDs repeated from earlier pages in this city or explicitly inactive for more than seven days. Overlapping matches count once; same-page repetitions are not historical duplicates. All new jobs on the triggering page are processed and saved.
 
-- At least **8 jobs** have recruiter activity older than seven days.
-- At least **8 jobs** have a `job_id` seen on earlier pages in this city during the current run. Count before deduplication; export unique jobs, and do not count same-page repetitions as historical duplicates.
+Defaults are `--stop-mode combined --stop-threshold 8`. Use `--stop-threshold 10` to stop at 10 jobs; `--stop-mode separate` retains independent condition thresholds. Counts are absolute, not scaled by page size; a threshold above the page's unique job count cannot be reached on that page.
 
-The threshold stays at 8 regardless of page length. All new jobs on the triggering page are processed and saved. Prefer detail activity and reuse captured results for duplicates. Labels such as “8天前活跃”, “30日内活跃”, and “本月活跃” count; “在线” and “7日内活跃” do not. Missing or ambiguous labels such as “近期活跃” do not count. With `--no-detail` or an explicit detail limit, use only activity already available.
+Prefer detail activity and reuse captured results. “8天前活跃” counts; “在线”, “7日内活跃”, missing and ambiguous labels do not. Broad upper bounds such as “30日内活跃” and “本月活跃” cannot establish inactivity exceeding seven days and do not count. With `--no-detail` or a detail limit, use only available activity.
 
 An explicit `--pages N` sets an optional page cap, including values above 10; omit it for automatic stopping. End of results, empty pages, capture timeouts, verification, login walls, connection errors, and interruption also save progress and stop. JSON metadata includes `pages_completed`, `stop_reason`, and `last_page`. `--no-detail` exports listings only; an explicit `--max-details N` retains excess jobs as unattempted.
 
