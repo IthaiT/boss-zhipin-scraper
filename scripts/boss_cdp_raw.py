@@ -19,7 +19,7 @@ BOSS直聘职位原文抓取 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.6.0"
+__version__ = "2.7.0"
 
 import json
 import time
@@ -78,7 +78,7 @@ HOT_CITY_URL = "https://www.zhipin.com/wapi/zpgeek/search/job/hot/city.json"
 CITY_GROUP_URL = "https://www.zhipin.com/wapi/zpCommon/data/cityGroup.json"
 
 # 逐页停止阈值；继续保留列表和详情之间的请求间隔。
-PAGE_STOP_THRESHOLD = 8
+PAGE_STOP_THRESHOLD = 10
 
 
 MACOS_BROWSER_CANDIDATES = (
@@ -182,7 +182,7 @@ DEFAULT_PROFILE_DIR = get_default_profile_dir()
 DEFAULT_EDGE_PROFILE_DIR = get_default_profile_dir("edge")
 
 DEFAULT_CDP_DATA_DIR = os.path.expanduser("~/.boss-zhipin-scraper/chrome-profile")
-DEFAULT_RESULT_DIR = os.path.expanduser("~/.boss-zhipin-scraper/job-result")
+DEFAULT_RESULT_DIR = os.path.abspath("job-results")
 DEFAULT_CITY_INPUT = "上海"
 LOGIN_PROBE_QUERY = "Java"
 LOGIN_PROBE_CITY = "101020100"
@@ -1975,6 +1975,8 @@ def load_search_state(path):
                 or not all(isinstance(v, (str, int)) for v in values.values())
                 for key, values in context.items())):
             raise ValueError("恢复文件中的详情导航上下文无效")
+    # Pre-default-on checkpoints retain their original opt-in/out behavior.
+    state["options"].setdefault("relevance", bool(state.get("relevance")))
     return state
 
 
@@ -2010,12 +2012,14 @@ def _scrape_list(keyword, city_input, max_pages, filters, output_path,
                 cdp_port=DEFAULT_CDP_PORT, fmt="json", allow_dom_fallback=False,
                 diff_base=None, detail=False, max_details=None, detail_output=None,
                 stop_threshold=PAGE_STOP_THRESHOLD, stop_mode="combined",
-                stop_consecutive=2, resume=None, relevance_policy=None):
+                stop_consecutive=2, resume=None, relevance_policy=None, relevance=True):
     if max_pages is not None and max_pages < 1:
         raise ValueError("max_pages must be positive or None")
     page_stop_reason(0, 0, 0, stop_threshold, stop_mode)
     if stop_consecutive < 1:
         raise ValueError("stop_consecutive must be positive")
+    if not relevance and relevance_policy:
+        raise ValueError("关闭相关性判断时不能同时指定 --relevance-policy")
     city_name, city_code = resolve_city(city_input)
     all_jobs = []
     seen = set()
@@ -2030,6 +2034,7 @@ def _scrape_list(keyword, city_input, max_pages, filters, output_path,
         "stop_threshold": stop_threshold, "stop_mode": stop_mode,
         "stop_consecutive": stop_consecutive, **filters,
         "relevance_policy": os.path.abspath(relevance_policy) if relevance_policy else None,
+        "relevance": relevance,
     }
     state = load_search_state(resume) if resume else {
         "schema_version": 1, "run_id": os.urandom(16).hex(), "options": options,
@@ -2048,8 +2053,11 @@ def _scrape_list(keyword, city_input, max_pages, filters, output_path,
         context = (state["pending_page"] or {}).get("detail_context", {})
         for job in all_jobs:
             job.update(context.get(job["job_id"], {}))
-    elif relevance_policy:
-        policy = load_relevance_policy(relevance_policy)
+    elif relevance:
+        policy = load_relevance_policy(relevance_policy) if relevance_policy else {
+            "criteria": f"寻找与搜索关键词“{keyword}”相关的岗位，根据职位描述和要求判断。"
+                        "不自行添加薪资、学历、经验或其他限制；信息不足时标为 unknown。",
+        }
         encoded = json.dumps(policy, ensure_ascii=False, sort_keys=True).encode("utf-8")
         state["relevance"] = {
             "policy": policy, "policy_hash": hashlib.sha256(encoded).hexdigest(), "decisions": {},
@@ -3340,7 +3348,7 @@ def main():
   %(prog)s --keyword "Java 风控" --pages 3 --detail --analysis
 
   # 只分析已有数据
-  %(prog)s --input ~/.boss-zhipin-scraper/job-result/boss_jobs_20260609_1200.json --analysis --no-detail
+  %(prog)s --input job-results/boss_jobs_20260609_1200.json --analysis --no-detail
 
   # 导出 CSV
   %(prog)s --keyword "Java 风控" --pages 3 --format csv
@@ -3362,15 +3370,17 @@ def main():
     p.add_argument("--city", default=DEFAULT_CITY_INPUT, help=f"城市 (中文名或代码，默认 {DEFAULT_CITY_INPUT})")
     p.add_argument("--pages", type=int, default=None, help="可选页数上限；默认按活跃状态/重复岗位自动停止")
     p.add_argument("--stop-threshold", type=int, default=PAGE_STOP_THRESHOLD,
-                   help="每页停止阈值，达到即停止（默认 8；超过 10 应传 11）")
+                   help="每页达标阈值（默认 10）；连续达标页数由 --stop-consecutive 指定")
     p.add_argument("--stop-mode", choices=["separate", "combined"], default="combined",
                    help="separate：各条件分别达到阈值；combined：按 job_id 合并去重后达到阈值")
     p.add_argument("--stop-consecutive", type=int, default=2,
                    help="连续多少页达到阈值才停止（默认 2；未达标页清零）")
     p.add_argument("--resume", metavar="STATE", help="从 .state.json 恢复原标签页和搜索参数")
     p.add_argument("--relevance-policy", metavar="JSON",
-                   help="可选求职标准文件（criteria）；逐页等待调用方 AI 填写 .review.json 后恢复")
-    p.add_argument("--output", default=None, help="列表数据输出路径")
+                   help="自定义求职标准文件（criteria）；未传时默认以搜索关键词生成标准")
+    p.add_argument("--relevance", action=argparse.BooleanOptionalAction, default=True,
+                   help="AI 相关性判断默认开启；--no-relevance 可显式关闭")
+    p.add_argument("--output", default=None, help="输出路径；默认当前工作区 job-results/ 下的 JSON+CSV")
     p.add_argument("--diff-base", default=None, help="is_new 对比基准文件(默认自动取同关键词同城市、日期早于本轮的最近一份结果)")
     p.add_argument("--detail-output", default=None, help="可选：额外保存独立详情文件（默认详情直接写入 --output）")
     p.add_argument("--cdp-port", type=int, default=DEFAULT_CDP_PORT,
@@ -3444,6 +3454,8 @@ def main():
         p.error("--stop-threshold 必须大于零")
     if args.stop_consecutive < 1:
         p.error("--stop-consecutive 必须大于零")
+    if not args.relevance and args.relevance_policy:
+        p.error("--no-relevance 不能与 --relevance-policy 同用")
     if args.max_details is not None and args.max_details < 0:
         p.error("--max-details 不能为负数")
 
@@ -3522,6 +3534,7 @@ def main():
                 stop_consecutive=args.stop_consecutive,
                 resume=args.resume,
                 relevance_policy=args.relevance_policy,
+                relevance=args.relevance,
             )
         except (LoginGateError, ValueError, OSError, RuntimeError) as e:
             print(str(e))

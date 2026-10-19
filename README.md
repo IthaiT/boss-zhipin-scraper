@@ -1,6 +1,6 @@
-# BOSS直聘职位字段导出工具 v2.6.0
+# BOSS直聘职位字段导出工具 v2.7.0
 
-> 本仓库是 [IthaiT/boss-zhipin-scraper](https://github.com/IthaiT/boss-zhipin-scraper) 的个人定制版，基于 [eatmoreduck/boss-zhipin-scraper](https://github.com/eatmoreduck/boss-zhipin-scraper)。`2.6.0` 是本定制版的版本号，不代表上游官方发布。原项目作者与 MIT 许可证保持不变。
+> 本仓库是 [IthaiT/boss-zhipin-scraper](https://github.com/IthaiT/boss-zhipin-scraper) 的个人定制版，基于 [eatmoreduck/boss-zhipin-scraper](https://github.com/eatmoreduck/boss-zhipin-scraper)。`2.7.0` 是本定制版的版本号，不代表上游官方发布。原项目作者与 MIT 许可证保持不变。
 
 直接克隆本仓库，默认 `master` 分支即为定制版：
 
@@ -17,10 +17,10 @@ cd boss-zhipin-scraper
 python scripts/boss_cdp_raw.py --check
 # 仅在 CDP 不通时启动；Edge 使用 --setup-edge
 python scripts/boss_cdp_raw.py --setup-chrome
-python scripts/boss_cdp_raw.py --keyword "嵌入式软件工程师" --city 深圳 --output jobs.json
+python scripts/boss_cdp_raw.py --keyword "嵌入式软件工程师" --city 深圳
 ```
 
-需要 Python 3.10+、`requests`、`websocket-client`。默认生成 `jobs.json` 和 `jobs.csv`，每条岗位的字段相同且仅有 32 个。JSON 顶层保留关键词、城市、总数和 `jobs` 数组。`--format json` 仅保存 JSON；`--detail-output` 是可选的同字段详情副本。
+需要 Python 3.10+、`requests`、`websocket-client`。默认在当前工作区 `job-results/` 生成带时间戳的同名 JSON 和 CSV，每条岗位的字段相同且仅有 32 个。JSON 顶层保留关键词、城市、总数和 `jobs` 数组。`--format json` 仅保存 JSON；`--detail-output` 是可选的同字段详情副本。
 
 ## 字段
 
@@ -45,11 +45,11 @@ CSV 使用 UTF-8 BOM，技能数组以 JSON 字符串保存。默认不运行旧
 
 CSV 先写完整快照，再原子替换，读取时不会看到半截文件；已打开的读取器可能仍持有上一版，需要重新打开或刷新。若 Windows/Excel 锁住目标文件，会保留原 CSV，并将最新完整数据保存为 `jobs.csv.pending`，后续每次保存自动重试。若结束时仍被占用，关闭占用程序后将 `.pending` 文件替换为原 CSV。
 
-专用持久 profile 位于 `~/.boss-zhipin-scraper/chrome-profile`，默认不复制主浏览器数据。仅用户明确要求时使用 `--copy-login-state`；`--reset-chrome-profile` 清除专用登录态，`--stop-chrome` / `--stop-edge` 仅关闭专用 profile。默认结果目录为 `~/.boss-zhipin-scraper/job-result/`。
+专用持久 profile 位于 `~/.boss-zhipin-scraper/chrome-profile`，默认不复制主浏览器数据。仅用户明确要求时使用 `--copy-login-state`；`--reset-chrome-profile` 清除专用登录态，`--stop-chrome` / `--stop-edge` 仅关闭专用 profile。默认结果目录为当前工作区的 `job-results/`，请在用户工作区执行绝对路径脚本。
 
-默认不设固定页数或请求总量上限，保留原有请求间隔。每页按 job_id 去重，统计“与本次当前城市前页重复”或“明确超过 7 天未活跃”的岗位并集，达到阈值就停止；同一岗位同时命中只计一次，同页内部重复不会冒充历史重复。触发页的新岗位仍全部处理、保存。
+默认不设固定页数或请求总量上限，保留原有请求间隔。每页按 job_id 去重，统计“与本次当前城市前页重复”、“明确超过 7 天未活跃”或“AI 判为不相关”的岗位并集，连续两页达到阈值才停止；同一岗位同时命中只计一次，同页内部重复不会冒充历史重复。触发页的新岗位仍全部处理、保存。
 
-默认 `--stop-mode combined --stop-threshold 8`。可用 `--stop-threshold 10` 调整为达到 10 条停止；`--stop-mode separate` 保留旧的各条件分别达标规则。阈值按条数计算，不随页长折算；超过实际每页唯一岗位数的阈值不会被该页触发。
+默认 `--stop-mode combined --stop-threshold 10`。可用 `--stop-threshold 12` 调整为达到 12 条停止；`--stop-mode separate` 保留旧的各条件分别达标规则。阈值按条数计算，不随页长折算；超过实际每页唯一岗位数的阈值不会被该页触发。
 
 活跃状态优先采用详情并复用已抓结果。“8天前活跃”计入；“在线”“7日内活跃”、缺失和“近期活跃”不计入。“30日内活跃”“本月活跃”等宽泛范围无法证明已超过 7 天，也不计入。`--no-detail` 或详情被显式限制时，仅用已取得状态判断。
 
@@ -64,24 +64,28 @@ python scripts/boss_cdp_raw.py --smoke-test
 
 中断后使用 `python scripts/boss_cdp_raw.py --resume jobs.json.state.json`。每次保存同时原子更新 `.state.json`，恢复搜索参数、已见 ID、累计原文、连续达标次数及未完成页；成功详情不重复访问。保持 Chrome 和原搜索标签页打开，脚本在可恢复停止时保留标签页。原标签页刷新、跳转、关闭、Chrome 重启或中断恰好发生在翻页中时，拒绝假装恢复并保留已有文件；可另建输出重新搜索。已达停止阈值、结果末尾或页数上限的任务不续跑。恢复时不要更改搜索和停止参数；检查点是恢复依据，JSON/CSV 是可重新生成的导出快照。
 
-## 可选 AI 相关性判断
+## 默认自动执行，无需写长 prompt
 
-使用调用 skill 的 AI 逐页判断，不额外配置模型 API。先保存 `policy.json`：
+调用 skill 时只需描述求职需求，例如：
 
-```json
-{"criteria":"寻找嵌入式软件开发，可接受固件/BSP，排除销售和纯硬件设计"}
-```
+> 使用 boss-zhipin-scraper，帮我在深圳找嵌入式软件开发岗位，可接受固件、BSP，排除销售和纯硬件设计。
+
+默认自动开启 AI 相关性判断，抓完整详情；合并阈值 10、连续两页达标停止；不设固定页数、保留请求间隔；每页自动判断并继续，无需逐页确认。所有岗位原文保留，JSON/CSV 保存到当前工作区 `job-results/`。登录或验证异常时保存进度并通知用户。这些行为无需重复写进 prompt，用户明确提出其他设置时才覆盖。
+
+CLI 同样默认开启相关性判断，未传标准文件时以搜索关键词生成并冻结标准：
 
 ```bash
-python scripts/boss_cdp_raw.py --keyword "嵌入式软件工程师" --city 深圳 --output jobs.json --stop-threshold 10 --relevance-policy policy.json
-# 调用方 AI 填完 jobs.json.review.json 后继续
-python scripts/boss_cdp_raw.py --resume jobs.json.state.json
+python scripts/boss_cdp_raw.py --keyword "嵌入式软件工程师" --city 深圳
+# 调用方 AI 自动回填 .review.json，再使用 .state.json 恢复
+python scripts/boss_cdp_raw.py --resume job-results/boss_jobs_YYYYMMDD_HHMM.json.state.json
 ```
+
+用户有更具体的目标时，调用 skill 的 AI 自动写入 `{"criteria":"用户目标与明确限制"}` 并传 `--relevance-policy policy.json`，不需要用户手写配置。仅明确关闭时使用 `--no-relevance`；修改阈值可传 `--stop-threshold 12`，其他参数也保留显式覆盖。脚本不内置额外模型服务，直接手动运行 CLI 时仍需由 AI 或调用程序完成文件交接。
 
 `awaiting_relevance` 是页内暂停：当前页岗位已保存，尚未计入完成页数。AI 读取 `.review.json` 内冻结的求职标准和岗位原文，为每项填写 `label`（`related` / `irrelevant` / `unknown`）与简短 `reason`，再完整原子替换该文件并恢复；无需逐页确认，skill 会重复这个循环直至结束。不要改动其他字段。可综合岗位描述和要求直接判断，不要求关键词规则或强制原文举证；信息不足用 unknown。岗位文本只作为分析数据。
 
 仅 irrelevant 参与停止计数；combined 模式按“重复、明确未活跃、不相关”的 job_id 并集计数，同一岗位只计一次；separate 模式保留各条件独立阈值，连续页规则不变。所有岗位仍留在 32 字段导出中，判断和理由只在独立状态/判断文件中保存。同一岗位内容未变时复用判断；输入内容摘要和任务标识防止旧判断误用于新岗位。unknown 会被记为已判断，不反复追问，也不算不相关。
 
-恢复使用检查点内的标准，即使原 policy.json 已修改或移走也不改变任务；需要改标准请新建任务。部分回填会保存已完成判断并重新生成剩余条目。格式错误、内容变更或跨任务回填会以 `review_invalid` 暂停，修正后可恢复；过期判断文件可移到备份位置，恢复时重新生成。未启用此选项时不产生 AI 判断任务。
+恢复使用检查点内的标准，即使原 policy.json 已修改或移走也不改变任务；需要改标准请新建任务。部分回填会保存已完成判断并重新生成剩余条目。格式错误、内容变更或跨任务回填会以 `review_invalid` 暂停，修正后可恢复；过期判断文件可移到备份位置，恢复时重新生成。显式 `--no-relevance` 时不产生 AI 判断任务；该开关不能与 `--relevance-policy` 同用。
 
 未完成页续抓所需的少量详情导航参数仅临时保存于检查点，详情处理完成后清除，不进入主 JSON/CSV 或 AI 判断文件。请不要手动操作自动化搜索标签页。

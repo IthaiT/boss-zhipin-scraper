@@ -70,7 +70,9 @@ SKILL.md / README(.en).md / CHANGELOG.md / CONTRIBUTING.md
 ## 逐页处理与停止（个人定制版，未发布）
 
 - 默认不传 `--pages`，无固定批次或请求总量上限；保留请求间隔。每页处理完详情后更新同一个累计 JSON/CSV，再继续滚动。
-- 默认 `--stop-mode combined --stop-threshold 8 --stop-consecutive 2`：按当页 job_id 合并“历史重复、明确超过七天未活跃、可选 AI 判为不相关”的并集；连续达标才停止，未达标清零。separate 保留各条件分别达标。同页重复不冒充前页重复，所有新岗位仍保存；未知活跃、不确定相关性不计入。
+- 默认 `--stop-mode combined --stop-threshold 10 --stop-consecutive 2`：按当页 job_id 合并“历史重复、明确超过七天未活跃、默认 AI 判为不相关”的并集；连续达标才停止，未达标清零。separate 保留各条件分别达标。同页重复不冒充前页重复，所有新岗位仍保存；未知活跃、不确定相关性不计入。
 - `.state.json` 原子保存搜索参数、原标签页标识、已见岗位、未完成页、连续次数及可选 AI 判断缓存；`--resume` 原位续跑，不重导航第一页。刷新/重启/翻页位置不明时拒绝错误恢复。运行锁避免同任务并发写入。
-- `--relevance-policy` 可选启用当前调用 AI 的逐页文件交接：awaiting_relevance 时 AI 填写 `.review.json` 的 label/reason 后恢复；只校验格式与任务/内容身份，不引入额外模型 API。标准随任务冻结；所有岗位仍保留，主输出岗位仍为 32 字段。
+- 默认启用当前调用 AI 的逐页文件交接；关键词生成默认标准，`--relevance-policy` 可自定义，`--no-relevance` 显式关闭：awaiting_relevance 时 AI 填写 `.review.json` 的 label/reason 后恢复；只校验格式与任务/内容身份，不引入额外模型 API。标准随任务冻结；所有岗位仍保留，主输出岗位仍为 32 字段。
 - CSV 原子替换，Windows 读取锁冲突时保留旧文件和最新 `.csv.pending`，后续保存重试；不要回退成直接覆盖写入。JSON 顶层进度不扩展 32 个岗位字段。
+
+- 默认结果目录为当前工作区 `job-results/`；skill 自动处理逐页判断循环，不要求用户在 prompt 重复默认操作，不逐页询问确认。旧检查点恢复时保留原任务的阈值和相关性开关。

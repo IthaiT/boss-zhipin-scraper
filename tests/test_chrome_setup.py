@@ -44,11 +44,10 @@ class ChromeSetupTests(unittest.TestCase):
         self.assertNotIn("/tmp/", module.DEFAULT_CDP_DATA_DIR)
         self.assertTrue(module.DEFAULT_CDP_DATA_DIR.endswith(".boss-zhipin-scraper/chrome-profile"))
 
-    def test_default_result_dir_is_persistent_user_state(self):
+    def test_default_result_dir_is_in_current_workspace(self):
         module = load_module()
 
-        self.assertNotIn("/tmp/", module.DEFAULT_RESULT_DIR)
-        self.assertTrue(module.DEFAULT_RESULT_DIR.endswith(".boss-zhipin-scraper/job-result"))
+        self.assertEqual(module.DEFAULT_RESULT_DIR, str(pathlib.Path("job-results").resolve()))
         self.assertTrue(module.default_output_path("jobs").startswith(module.DEFAULT_RESULT_DIR))
         self.assertTrue(module.default_output_path("details").startswith(module.DEFAULT_RESULT_DIR))
         self.assertIn("boss_jobs_", module.default_output_path("jobs"))
@@ -946,6 +945,8 @@ class ChromeSetupTests(unittest.TestCase):
         返回新模块对象，异常类/全局计数器不能跨实例比较）。
         """
         module._request_counter = 0
+        kwargs.setdefault("relevance", bool(kwargs.get("relevance_policy")))
+        kwargs.setdefault("stop_threshold", 8)
         kwargs.setdefault("stop_mode", "separate")
         kwargs.setdefault("stop_consecutive", 1)
         with mock.patch.object(module, "CDPSession", lambda port=9222: cdp), \
@@ -1402,6 +1403,116 @@ class ChromeSetupTests(unittest.TestCase):
             changed = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
             self.assertEqual([item["job_id"] for item in changed["jobs"]], ["a"])
 
+    def test_keyword_policy_is_automatic_and_explicit_opt_out_skips_review(self):
+        module = load_module()
+        cdp = FakeCaptureCDP()
+        with tempfile.TemporaryDirectory() as tmp:
+            output = pathlib.Path(tmp) / "jobs.json"
+            with mock.patch.object(module.NetworkJoblistCapture, "wait_next_response", return_value=
+                                   self._job_page(["a"], has_more=False)):
+                first = self._run_scrape_list(module, cdp, str(output), relevance=True)
+            self.assertEqual(first["stop_reason"], "awaiting_relevance")
+            worksheet = json.loads(pathlib.Path(first["review_file"]).read_text(encoding="utf-8"))
+            self.assertIn("Java", worksheet["policy"]["criteria"])
+            state = module.load_search_state(first["state_file"])
+            self.assertTrue(state["options"]["relevance"])
+            self.assertIsNone(state["options"]["relevance_policy"])
+            self._fill_review(module, first["review_file"], {"a": "related"})
+            with mock.patch.object(module.NetworkJoblistCapture, "wait_next_response") as capture:
+                result = self._run_scrape_list(module, cdp, str(output), relevance=True,
+                                               resume=first["state_file"])
+            capture.assert_not_called()
+            self.assertEqual(result["stop_reason"], "end_of_results")
+            with mock.patch.object(module.NetworkJoblistCapture, "wait_next_response", return_value=
+                                   self._job_page(["b"], has_more=False)):
+                disabled = self._run_scrape_list(module, cdp, str(pathlib.Path(tmp) / "disabled.json"),
+                                                 relevance=False)
+            self.assertEqual(disabled["stop_reason"], "end_of_results")
+            self.assertNotIn("review_file", disabled)
+            self.assertNotIn("relevance", module.load_search_state(disabled["state_file"]))
+
+    def test_default_threshold_is_ten_for_two_consecutive_reviewed_pages(self):
+        module = load_module()
+        self.assertEqual(module.PAGE_STOP_THRESHOLD, 10)
+        cdp = FakeCaptureCDP()
+        options = dict(relevance=True, stop_mode="combined", stop_threshold=module.PAGE_STOP_THRESHOLD,
+                       stop_consecutive=2)
+        with tempfile.TemporaryDirectory() as tmp:
+            output = pathlib.Path(tmp) / "jobs.json"
+            with mock.patch.object(module.NetworkJoblistCapture, "wait_next_response", return_value=
+                                   self._job_page(range(10))):
+                first = self._run_scrape_list(module, cdp, str(output), pages=None, **options)
+            self._fill_review(module, first["review_file"], {str(i): "irrelevant" for i in range(10)})
+            with mock.patch.object(module.NetworkJoblistCapture, "wait_next_response", return_value=
+                                   self._job_page(range(10, 20))):
+                second = self._run_scrape_list(module, cdp, str(output), pages=None,
+                                               resume=first["state_file"], **options)
+            self.assertEqual(second["stop_reason"], "awaiting_relevance")
+            self.assertEqual(second["stop_streak"], 1)
+            self._fill_review(module, second["review_file"], {str(i): "irrelevant" for i in range(10, 20)})
+            with mock.patch.object(module.NetworkJoblistCapture, "wait_next_response") as capture:
+                final = self._run_scrape_list(module, cdp, str(output), pages=None,
+                                              resume=first["state_file"], **options)
+            capture.assert_not_called()
+            self.assertEqual(final["stop_reason"], "combined_threshold")
+            self.assertEqual(final["stop_streak"], 2)
+            self.assertEqual(final["last_page"]["combined_jobs"], 10)
+            self.assertEqual(final["total"], 20)
+
+    def test_legacy_checkpoint_keeps_disabled_review_and_old_threshold_in_cli(self):
+        module = load_module()
+        cdp = FakeCaptureCDP()
+        with tempfile.TemporaryDirectory() as tmp:
+            output = pathlib.Path(tmp) / "jobs.json"
+            first = self._interrupt_at_next_page(module, cdp, output, self._job_page([1]))
+            state = module.load_search_state(first["state_file"])
+            state["options"].pop("relevance")  # A 2.6 checkpoint had no explicit switch.
+            module._atomic_write_json(first["state_file"], state)
+            with mock.patch.object(sys, "argv", ["boss", "--resume", first["state_file"]]), \
+                    mock.patch.object(module, "require_runtime_dependencies", return_value=True), \
+                    mock.patch.object(module, "resolve_city", return_value=("上海", "101020100")), \
+                    mock.patch.object(module, "CDPSession", return_value=cdp), \
+                    mock.patch("time.sleep", lambda seconds: None), \
+                    mock.patch.object(module.NetworkJoblistCapture, "wait_next_response", return_value=
+                                      self._job_page([2], has_more=False)):
+                module.main()
+            saved = module.load_search_state(first["state_file"])
+            self.assertFalse(saved["options"]["relevance"])
+            self.assertEqual(saved["options"]["stop_threshold"], 8)
+            self.assertEqual(saved["meta"]["stop_reason"], "end_of_results")
+            self.assertEqual(len(saved["jobs"]), 2)
+            self.assertNotIn("review_file", saved["meta"])
+
+    def test_default_workspace_output_and_explicit_cli_overrides(self):
+        for overrides in ([], ["--no-relevance", "--stop-threshold", "12", "--stop-consecutive", "3",
+                               "--pages", "5", "--no-detail", "--format", "json"]):
+            module = load_module()
+            with self.subTest(overrides=overrides), tempfile.TemporaryDirectory() as tmp:
+                directory = str(pathlib.Path(tmp) / "job-results")
+                with mock.patch.object(sys, "argv", ["boss", "--keyword", "Firmware"] + overrides), \
+                        mock.patch.object(module, "DEFAULT_RESULT_DIR", directory), \
+                        mock.patch.object(module, "require_runtime_dependencies", return_value=True), \
+                        mock.patch.object(module, "resolve_city", return_value=("上海", "101020100")), \
+                        mock.patch.object(module, "scrape_list", return_value={"jobs": []}) as scrape:
+                    module.main()
+                self.assertTrue(scrape.call_args.args[4].startswith(directory))
+                self.assertEqual(scrape.call_args.kwargs["relevance"], not bool(overrides))
+                self.assertEqual(scrape.call_args.kwargs["stop_threshold"], 12 if overrides else 10)
+                self.assertEqual(scrape.call_args.kwargs["stop_consecutive"], 3 if overrides else 2)
+                self.assertEqual(scrape.call_args.args[2], 5 if overrides else None)
+                self.assertEqual(scrape.call_args.kwargs["fmt"], "json" if overrides else "csv")
+                self.assertEqual(scrape.call_args.kwargs["detail"], not bool(overrides))
+
+    def test_explicit_relevance_opt_out_conflicts_with_policy(self):
+        module = load_module()
+        with mock.patch.object(sys, "argv", ["boss", "--no-relevance", "--relevance-policy", "policy.json"]), \
+                mock.patch.object(module, "require_runtime_dependencies") as dependencies, \
+                mock.patch("sys.stderr"):
+            with self.assertRaises(SystemExit) as raised:
+                module.main()
+        self.assertEqual(raised.exception.code, 2)
+        dependencies.assert_not_called()
+
     def test_eight_old_jobs_stop_after_saving_entire_page(self):
         module = load_module()
         page = self._job_page(range(15))
@@ -1549,6 +1660,8 @@ class ChromeSetupTests(unittest.TestCase):
                 self.assertTrue(scrape.call_args.kwargs["detail"])
                 self.assertEqual(scrape.call_args.kwargs["stop_mode"], "combined")
                 self.assertEqual(scrape.call_args.kwargs["stop_consecutive"], 2)
+                self.assertEqual(scrape.call_args.kwargs["stop_threshold"], 10)
+                self.assertTrue(scrape.call_args.kwargs["relevance"])
 
     def test_merge_preserves_fresh_page_details_over_older_rows(self):
         module = load_module()
