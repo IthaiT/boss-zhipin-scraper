@@ -1183,12 +1183,17 @@ class ChromeSetupTests(unittest.TestCase):
             raise KeyboardInterrupt
         def finished_details(data, max_details, **kwargs):
             self.assertEqual([j["title"] for j in data["jobs"]], ["b"])
+            detail_url = module.build_detail_url(data["jobs"][0])
+            self.assertIn("securityId=source-security", detail_url)
+            self.assertIn("lid=source-lid", detail_url)
             kwargs["on_update"]([dict(data["jobs"][0], job_description="new text",
                                       capture_status="success", capture_reason="")])
         with tempfile.TemporaryDirectory() as tmp:
             output = pathlib.Path(tmp) / "jobs.json"
+            page = self._job_page(["a", "b"], has_more=False)
+            page["zpData"]["jobList"][1].update(securityId="source-security", lid="source-lid")
             with mock.patch.object(module.NetworkJoblistCapture, "wait_next_response", return_value=
-                                   self._job_page(["a", "b"], has_more=False)), \
+                                   page), \
                     mock.patch.object(module, "scrape_details", side_effect=interrupted_details):
                 first = self._run_scrape_list(module, cdp, str(output), detail=True)
             self.assertEqual(first["pages_completed"], 0)
@@ -1257,6 +1262,145 @@ class ChromeSetupTests(unittest.TestCase):
                 result = self._run_scrape_list(module, cdp, str(output), pages=None, resume=str(state_path))
             self.assertEqual(result["total"], 2)
             self.assertEqual(result["pages_completed"], 2)
+
+    def _fill_review(self, module, path, labels):
+        review = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+        for item in review["jobs"]:
+            item["label"] = labels.get(item["job"]["title"], "unknown")
+            item["reason"] = "根据保存的求职标准与岗位原文判断"
+        module._atomic_write_json(path, review)
+
+    def test_ai_review_union_cache_and_consecutive_resume(self):
+        module = load_module()
+        cdp = FakeCaptureCDP()
+        with tempfile.TemporaryDirectory() as tmp:
+            output = pathlib.Path(tmp) / "jobs.json"
+            policy = pathlib.Path(tmp) / "policy.json"
+            policy.write_text(json.dumps({"criteria": "Java 开发，排除销售"}), encoding="utf-8")
+            options = dict(relevance_policy=str(policy), stop_mode="combined",
+                           stop_threshold=2, stop_consecutive=2)
+            with mock.patch.object(module.NetworkJoblistCapture, "wait_next_response", return_value=
+                                   self._job_page(["a", "b", "c"])) as capture:
+                first = self._run_scrape_list(module, cdp, str(output), pages=None, **options)
+            capture.assert_called_once()
+            self.assertEqual(first["stop_reason"], "awaiting_relevance")
+            self.assertEqual(first["pages_completed"], 0)
+            self.assertEqual(first["total"], 3)
+            self._fill_review(module, first["review_file"], {"a": "irrelevant", "b": "irrelevant"})
+            policy.write_text(json.dumps({"criteria": "changed during a long chat"}), encoding="utf-8")
+            with mock.patch.object(module.NetworkJoblistCapture, "wait_next_response", return_value=
+                                   self._job_page(["a", "b", "d"])) as capture:
+                second = self._run_scrape_list(module, cdp, str(output), pages=None,
+                                               resume=first["state_file"], **options)
+            capture.assert_called_once()
+            self.assertEqual(second["stop_streak"], 1)
+            self.assertEqual(second["stop_reason"], "awaiting_relevance")
+            review = json.loads(pathlib.Path(second["review_file"]).read_text(encoding="utf-8"))
+            self.assertEqual(review["policy"]["criteria"], "Java 开发，排除销售")
+            self.assertEqual([item["job"]["title"] for item in review["jobs"]], ["d"])
+            self._fill_review(module, second["review_file"], {"d": "related"})
+            with mock.patch.object(module.NetworkJoblistCapture, "wait_next_response") as capture:
+                result = self._run_scrape_list(module, cdp, str(output), pages=None,
+                                               resume=first["state_file"], **options)
+            capture.assert_not_called()
+            self.assertEqual(result["stop_reason"], "combined_threshold")
+            self.assertEqual(result["stop_streak"], 2)
+            self.assertEqual(result["last_page"]["combined_jobs"], 2)
+            self.assertEqual(result["last_page"]["irrelevant_jobs"], 2)
+            self.assertEqual(result["last_page"]["duplicate_jobs"], 2)
+            self.assertEqual(result["total"], 4)
+            exported = json.loads(output.read_text(encoding="utf-8"))
+            self.assertTrue(all(set(job) == set(module.EXPORT_COLUMNS) for job in exported["jobs"]))
+
+    def test_invalid_ai_reviews_do_not_count_or_advance_and_can_be_corrected(self):
+        for invalid in ("stale_run", "wrong_hash", "bad_label", "duplicate", "broken_json"):
+            module = load_module()
+            cdp = FakeCaptureCDP()
+            with self.subTest(invalid=invalid), tempfile.TemporaryDirectory() as tmp:
+                output = pathlib.Path(tmp) / "jobs.json"
+                policy = pathlib.Path(tmp) / "policy.json"
+                policy.write_text('{"criteria": "Java"}', encoding="utf-8")
+                options = dict(relevance_policy=str(policy))
+                with mock.patch.object(module.NetworkJoblistCapture, "wait_next_response", return_value=
+                                       self._job_page(["a"], has_more=False)):
+                    first = self._run_scrape_list(module, cdp, str(output), **options)
+                review_path = pathlib.Path(first["review_file"])
+                self._fill_review(module, str(review_path), {"a": "irrelevant"})
+                valid = review_path.read_text(encoding="utf-8")
+                review = json.loads(valid)
+                if invalid == "stale_run":
+                    review["run_id"] = "another run"
+                elif invalid == "wrong_hash":
+                    review["jobs"][0]["input_hash"] = "old job text"
+                elif invalid == "bad_label":
+                    review["jobs"][0]["label"] = "yes"
+                elif invalid == "duplicate":
+                    review["jobs"].append(review["jobs"][0])
+                review_path.write_text("{" if invalid == "broken_json" else json.dumps(review), encoding="utf-8")
+                with mock.patch.object(module.NetworkJoblistCapture, "wait_next_response") as capture:
+                    result = self._run_scrape_list(module, cdp, str(output),
+                                                   resume=first["state_file"], **options)
+                capture.assert_not_called()
+                self.assertEqual(result["stop_reason"], "review_invalid")
+                self.assertEqual(result["stop_streak"], 0)
+                self.assertEqual(result["pages_completed"], 0)
+                review_path.write_text(valid, encoding="utf-8")
+                with mock.patch.object(module.NetworkJoblistCapture, "wait_next_response"):
+                    fixed = self._run_scrape_list(module, cdp, str(output),
+                                                  resume=first["state_file"], **options)
+                self.assertEqual(fixed["stop_reason"], "end_of_results")
+                self.assertEqual(fixed["total"], 1)
+
+    def test_unknown_ai_review_preserves_jobs_and_does_not_repeat_details(self):
+        module = load_module()
+        cdp = FakeCaptureCDP()
+        def details(data, max_details, **kwargs):
+            kwargs["on_update"]([dict(job, capture_status="partial", capture_reason="missing_description")
+                                  for job in data["jobs"]])
+        with tempfile.TemporaryDirectory() as tmp:
+            output = pathlib.Path(tmp) / "jobs.json"
+            policy = pathlib.Path(tmp) / "policy.json"
+            policy.write_text('{"criteria": "Java"}', encoding="utf-8")
+            options = dict(relevance_policy=str(policy), stop_threshold=1, detail=True)
+            with mock.patch.object(module.NetworkJoblistCapture, "wait_next_response", return_value=
+                                   self._job_page(["a"], has_more=False)), \
+                    mock.patch.object(module, "scrape_details", side_effect=details) as detail_capture:
+                first = self._run_scrape_list(module, cdp, str(output), **options)
+            detail_capture.assert_called_once()
+            self._fill_review(module, first["review_file"], {})
+            with mock.patch.object(module.NetworkJoblistCapture, "wait_next_response") as capture, \
+                    mock.patch.object(module, "scrape_details") as detail_capture:
+                final = self._run_scrape_list(module, cdp, str(output), resume=first["state_file"], **options)
+            capture.assert_not_called()
+            detail_capture.assert_not_called()
+            self.assertEqual(final["stop_reason"], "end_of_results")
+            self.assertEqual(final["stop_streak"], 0)
+            self.assertEqual(final["last_page"]["irrelevant_jobs"], 0)
+            self.assertEqual(final["total"], 1)
+
+    def test_partial_reviews_and_changed_job_text_invalidate_cache(self):
+        module = load_module()
+        state = {"run_id": "test-run", "pending_page": {"number": 1}, "relevance": {
+            "policy": {"criteria": "Java"}, "policy_hash": "frozen", "decisions": {}}}
+        jobs = [{"job_id": "a", "title": "Java", "job_description": "original"},
+                {"job_id": "b", "title": "Other", "job_description": "unclear"}]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(pathlib.Path(tmp) / "review.json")
+            self.assertEqual(module.review_page_relevance(state, jobs, path), (set(), 2))
+            data = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+            data["jobs"][0].update(label="irrelevant", reason="not the requested role")
+            module._atomic_write_json(path, data)
+            self.assertEqual(module.review_page_relevance(state, jobs, path), ({"a"}, 1))
+            remaining = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+            self.assertEqual([item["job_id"] for item in remaining["jobs"]], ["b"])
+            remaining["jobs"][0].update(label="unknown", reason="insufficient information")
+            module._atomic_write_json(path, remaining)
+            self.assertEqual(module.review_page_relevance(state, jobs, path), ({"a"}, 0))
+            jobs[0]["job_description"] = "changed responsibilities"
+            state["pending_page"] = {"number": 2}
+            self.assertEqual(module.review_page_relevance(state, jobs, path), (set(), 1))
+            changed = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+            self.assertEqual([item["job_id"] for item in changed["jobs"]], ["a"])
 
     def test_eight_old_jobs_stop_after_saving_entire_page(self):
         module = load_module()
@@ -2571,7 +2715,7 @@ class FakeCaptureCDP:
 
     def eval_js(self, js, sid):
         self.sent.append(("Runtime.evaluate", {"expression": js}))
-        if js == "window.__bossScraperCheckpoint":
+        if js == "location.href === window.__bossScraperURL ? window.__bossScraperCheckpoint : null":
             return self.marker
         if js.startswith("window.__bossScraperCheckpoint = "):
             self.marker = json.loads(js.split(" = ", 1)[1].split(";", 1)[0])

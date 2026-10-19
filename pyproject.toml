@@ -1,6 +1,6 @@
 [project]
 name = "boss-zhipin-scraper"
-version = "2.5.0"
+version = "2.6.0"
 description = "BOSS直聘原文导出 — Chrome CDP + JSON/CSV"
 readme = "README.md"
 license = { text = "MIT" }

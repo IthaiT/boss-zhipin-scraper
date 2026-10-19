@@ -19,7 +19,7 @@ BOSS直聘职位原文抓取 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.5.0"
+__version__ = "2.6.0"
 
 import json
 import time
@@ -1821,7 +1821,91 @@ def load_existing_details(input_path=None, detail_output=None, result_dir=DEFAUL
 # 抓取列表
 # ============================================================
 RESUMABLE_STOPS = {"interrupted", "connection_error", "runtime_error",
-                   "login_required", "security_check", "no_response", "response_error"}
+                   "login_required", "security_check", "no_response", "response_error",
+                   "awaiting_relevance", "review_invalid"}
+
+
+class RelevanceReviewError(ValueError):
+    """A stale or malformed AI review must not influence stopping."""
+
+
+def load_relevance_policy(path):
+    """Freeze user criteria once per run so long chats cannot change the task."""
+    with open(path, encoding="utf-8") as f:
+        policy = json.load(f)
+    if (not isinstance(policy, dict) or not isinstance(policy.get("criteria"), str)
+            or not policy["criteria"].strip()):
+        raise ValueError("相关性配置必须是含非空 criteria 字符串的 JSON 对象")
+    return policy
+
+
+def relevance_input_hash(job, policy_hash):
+    """Invalidate cached judgments when the captured job content changes."""
+    record = export_job_record(job)
+    content = {key: value for key, value in record.items()
+               if key not in {"captured_at", "boss_active_status", "capture_status", "capture_reason"}}
+    encoded = json.dumps([policy_hash, content], ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def review_page_relevance(state, jobs, review_path):
+    """Exchange one page with the invoking AI through an atomic JSON worksheet.
+
+    No model API, credentials, or keyword heuristics: the skill's caller fills
+    label/reason, while this function validates identity and counts the result.
+    """
+    review = state["relevance"]
+    pending = state["pending_page"]
+    unique = {job["job_id"]: export_job_record(job) for job in jobs}
+    hashes = {key: relevance_input_hash(job, review["policy_hash"])
+              for key, job in unique.items()}
+    if pending.get("review_requested") and os.path.exists(review_path):
+        try:
+            with open(review_path, encoding="utf-8") as f:
+                submitted = json.load(f)
+            if (not isinstance(submitted, dict) or submitted.get("schema_version") != 1
+                    or submitted.get("run_id") != state["run_id"]
+                    or submitted.get("policy_hash") != review["policy_hash"]
+                    or submitted.get("policy") != review["policy"]
+                    or submitted.get("page") != pending["number"]
+                    or not isinstance(submitted.get("jobs"), list)):
+                raise RelevanceReviewError("相关性判断文件与当前任务、页码或求职标准不符")
+            accepted = {}
+            submitted_ids = set()
+            for item in submitted["jobs"]:
+                if not isinstance(item, dict):
+                    raise RelevanceReviewError("相关性判断条目必须是对象")
+                job_id = item.get("job_id")
+                if (not isinstance(job_id, str) or job_id not in unique or job_id in submitted_ids
+                        or item.get("input_hash") != hashes[job_id]
+                        or item.get("job") != unique[job_id]):
+                    raise RelevanceReviewError("相关性判断包含重复、未知或内容已变更的岗位")
+                submitted_ids.add(job_id)
+                label, reason = item.get("label"), item.get("reason", "")
+                if label is None:
+                    continue
+                if label not in {"related", "irrelevant", "unknown"} or not isinstance(reason, str):
+                    raise RelevanceReviewError("label 只能是 related / irrelevant / unknown，reason 必须是文字")
+                if not reason.strip():
+                    raise RelevanceReviewError("请为每项判断填写简短 reason")
+                accepted[job_id] = {"input_hash": hashes[job_id], "label": label, "reason": reason}
+            review["decisions"].update(accepted)
+        except (OSError, ValueError, TypeError) as exc:
+            raise RelevanceReviewError(str(exc)) from exc
+    missing = [key for key in unique
+               if review["decisions"].get(key, {}).get("input_hash") != hashes[key]]
+    if missing:
+        worksheet = {
+            "schema_version": 1, "run_id": state["run_id"], "page": pending["number"],
+            "policy": review["policy"], "policy_hash": review["policy_hash"],
+            "jobs": [{"job_id": key, "input_hash": hashes[key], "job": unique[key],
+                      "label": None, "reason": ""} for key in missing],
+        }
+        _atomic_write_json(review_path, worksheet)
+        pending["review_requested"] = True
+    irrelevant = {key for key in unique if key not in missing
+                  and review["decisions"][key]["label"] == "irrelevant"}
+    return irrelevant, len(missing)
 
 
 @contextmanager
@@ -1884,6 +1968,13 @@ def load_search_state(path):
                 or not all(i in pending["job_ids"] for i in pending["duplicate_ids"])
                 or type(pending.get("reached_end")) is not bool):
             raise ValueError("恢复文件中的未完成页无效")
+        context = pending.get("detail_context", {})
+        if (not isinstance(context, dict) or any(
+                key not in ids or not isinstance(values, dict)
+                or not set(values) <= {"lid", "security_id"}
+                or not all(isinstance(v, (str, int)) for v in values.values())
+                for key, values in context.items())):
+            raise ValueError("恢复文件中的详情导航上下文无效")
     return state
 
 
@@ -1893,14 +1984,15 @@ def page_marker(run_id, page):
 
 
 def page_stop_reason(duplicate_count, inactive_count, combined_count,
-                     threshold=PAGE_STOP_THRESHOLD, mode="combined"):
+                     threshold=PAGE_STOP_THRESHOLD, mode="combined", irrelevant_count=0):
     """Apply a per-page stop rule; combined_count is a union of job IDs."""
     if threshold < 1 or mode not in {"separate", "combined"}:
         raise ValueError("stop threshold must be positive and mode separate or combined")
     if mode == "combined":
         return "combined_threshold" if combined_count >= threshold else ""
     for count, reason in ((duplicate_count, "duplicate_threshold"),
-                          (inactive_count, "inactive_threshold")):
+                          (inactive_count, "inactive_threshold"),
+                          (irrelevant_count, "irrelevant_threshold")):
         if count >= threshold:
             return reason
     return ""
@@ -1918,7 +2010,7 @@ def _scrape_list(keyword, city_input, max_pages, filters, output_path,
                 cdp_port=DEFAULT_CDP_PORT, fmt="json", allow_dom_fallback=False,
                 diff_base=None, detail=False, max_details=None, detail_output=None,
                 stop_threshold=PAGE_STOP_THRESHOLD, stop_mode="combined",
-                stop_consecutive=2, resume=None):
+                stop_consecutive=2, resume=None, relevance_policy=None):
     if max_pages is not None and max_pages < 1:
         raise ValueError("max_pages must be positive or None")
     page_stop_reason(0, 0, 0, stop_threshold, stop_mode)
@@ -1937,11 +2029,13 @@ def _scrape_list(keyword, city_input, max_pages, filters, output_path,
         "detail": detail, "max_details": max_details, "detail_output": detail_output,
         "stop_threshold": stop_threshold, "stop_mode": stop_mode,
         "stop_consecutive": stop_consecutive, **filters,
+        "relevance_policy": os.path.abspath(relevance_policy) if relevance_policy else None,
     }
     state = load_search_state(resume) if resume else {
         "schema_version": 1, "run_id": os.urandom(16).hex(), "options": options,
         "pending_page": None, "base_ids": [], "target_id": None,
     }
+    state["options"].setdefault("relevance_policy", None)
     if resume:
         if state["options"] != options:
             raise ValueError("恢复参数与保存时不一致；请仅使用 --resume STATE，不修改搜索或停止规则")
@@ -1949,6 +2043,17 @@ def _scrape_list(keyword, city_input, max_pages, filters, output_path,
             raise ValueError("此任务已完成停止规则或页数上限；请新建搜索")
         all_jobs = state["jobs"]
         seen = {job["job_id"] for job in all_jobs}
+        # Preserve only the pending page's minimal navigation context; delivery
+        # records remain the 32-field projection and never gain these keys.
+        context = (state["pending_page"] or {}).get("detail_context", {})
+        for job in all_jobs:
+            job.update(context.get(job["job_id"], {}))
+    elif relevance_policy:
+        policy = load_relevance_policy(relevance_policy)
+        encoded = json.dumps(policy, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        state["relevance"] = {
+            "policy": policy, "policy_hash": hashlib.sha256(encoded).hexdigest(), "decisions": {},
+        }
 
     # 选定 is_new 对比基准(#88):显式 --diff-base 优先,否则按规则自动选取
     if resume:
@@ -2009,6 +2114,9 @@ def _scrape_list(keyword, city_input, max_pages, filters, output_path,
     if resume:
         meta = dict(state["meta"], stop_reason="")
     meta["state_file"] = state_path
+    review_path = os.path.abspath(os.fspath(output_path) + ".review.json")
+    if state.get("relevance"):
+        meta["review_file"] = review_path
     state["base_ids"] = sorted(base_ids)
     for job in all_jobs:
         job["is_new"] = job["job_id"] not in base_ids
@@ -2095,7 +2203,9 @@ def _scrape_list(keyword, city_input, max_pages, filters, output_path,
             raise ValueError("无法连接原搜索标签页；请保持 Chrome 与原标签页打开") from exc
         if resume:
             expected_page = (state["pending_page"] or {}).get("number", meta["pages_completed"])
-            marker = cdp.eval_js("window.__bossScraperCheckpoint", sid)
+            marker = cdp.eval_js(
+                "location.href === window.__bossScraperURL ? window.__bossScraperCheckpoint : null", sid,
+            )
             if marker != page_marker(state["run_id"], expected_page):
                 raise ValueError("原搜索标签页已刷新、跳转或翻页未完成，无法原位恢复；已保存数据不变")
         validated = True
@@ -2209,12 +2319,17 @@ def _scrape_list(keyword, city_input, max_pages, filters, output_path,
                     "number": pg, "job_ids": [job["job_id"] for job in jobs],
                     "duplicate_ids": sorted(duplicate_ids), "page_start": page_start,
                     "reached_end": reached_end,
+                    "detail_context": {
+                        job["job_id"]: {key: job[key] for key in ("lid", "security_id") if job.get(key)}
+                        for job in all_jobs[page_start:]
+                    },
                 }
                 marker_json = json.dumps(page_marker(state["run_id"], pg))
-                cdp.eval_js(f"window.__bossScraperCheckpoint = {marker_json}; void 0;", sid)
+                cdp.eval_js(f"window.__bossScraperCheckpoint = {marker_json};"
+                            "window.__bossScraperURL = location.href; void 0;", sid)
                 save_progress()
 
-            if detail and all_jobs[page_start:]:
+            if detail and all_jobs[page_start:] and not state["pending_page"].get("details_done"):
                 # A page is processed before the next scroll. Keep earlier pages
                 # in every snapshot, including saves made during detail capture.
                 def update_page(records):
@@ -2241,14 +2356,27 @@ def _scrape_list(keyword, city_input, max_pages, filters, output_path,
             if gate:
                 meta["stop_reason"] = gate
                 break  # Keep pending_page: finish this page's details on resume.
+            state["pending_page"]["details_done"] = True
+            state["pending_page"].pop("detail_context", None)
             records_by_id = {job["job_id"]: job for job in all_jobs}
+            irrelevant_ids = set()
+            if state.get("relevance"):
+                irrelevant_ids, missing_reviews = review_page_relevance(
+                    state, [records_by_id[job["job_id"]] for job in jobs], review_path,
+                )
+                meta["review_pending"] = missing_reviews
+                if missing_reviews:
+                    meta["stop_reason"] = "awaiting_relevance"
+                    print(f"  等待 AI 判断 {missing_reviews} 个岗位：{review_path}")
+                    print(f"  填写 label/reason 后使用 --resume {state_path} 继续。")
+                    break
             inactive_ids = {
                 job["job_id"] for job in jobs if is_inactive_over_seven_days(
                     export_job_record(records_by_id[job["job_id"]])["boss_active_status"]
                 )
             }
             inactive_count = sum(job["job_id"] in inactive_ids for job in jobs)
-            combined_count = len(duplicate_ids | inactive_ids)
+            combined_count = len(duplicate_ids | inactive_ids | irrelevant_ids)
             meta["pages_completed"] = pg
             state["pending_page"] = None
             meta["last_page"] = {
@@ -2257,8 +2385,11 @@ def _scrape_list(keyword, city_input, max_pages, filters, output_path,
             }
             if stop_mode == "combined":
                 meta["last_page"].update(combined_jobs=combined_count)
+            if state.get("relevance"):
+                meta["last_page"]["irrelevant_jobs"] = len(irrelevant_ids)
             threshold_reason = page_stop_reason(
                 duplicate_count, inactive_count, combined_count, stop_threshold, stop_mode,
+                irrelevant_count=len(irrelevant_ids),
             )
             meta["stop_streak"] = meta["stop_streak"] + 1 if threshold_reason else 0
             if threshold_reason and meta["stop_streak"] >= stop_consecutive:
@@ -2269,6 +2400,7 @@ def _scrape_list(keyword, city_input, max_pages, filters, output_path,
                 meta["stop_reason"] = "page_limit"
             save_progress()
             print(f"  本页重复 {duplicate_count} 条，超过 7 天未活跃 {inactive_count} 条"
+                  f"，明确不相关 {len(irrelevant_ids)} 条"
                   f"（{stop_mode}，阈值 {stop_threshold} 条，合并去重 {combined_count} 条，"
                   f"连续达标 {meta['stop_streak']}/{stop_consecutive} 页）。")
             if meta["stop_reason"]:
@@ -2279,6 +2411,9 @@ def _scrape_list(keyword, city_input, max_pages, filters, output_path,
             print(f"  翻页等待 {d:.0f}s...\n")
             time.sleep(d)
 
+    except RelevanceReviewError as exc:
+        meta["stop_reason"] = "review_invalid"
+        print(f"\n⚠️ {exc}；请修正 {review_path} 后恢复，原始岗位均保留。")
     except KeyboardInterrupt:
         meta["stop_reason"] = "interrupted"
         print("\n中断")
@@ -3233,6 +3368,8 @@ def main():
     p.add_argument("--stop-consecutive", type=int, default=2,
                    help="连续多少页达到阈值才停止（默认 2；未达标页清零）")
     p.add_argument("--resume", metavar="STATE", help="从 .state.json 恢复原标签页和搜索参数")
+    p.add_argument("--relevance-policy", metavar="JSON",
+                   help="可选求职标准文件（criteria）；逐页等待调用方 AI 填写 .review.json 后恢复")
     p.add_argument("--output", default=None, help="列表数据输出路径")
     p.add_argument("--diff-base", default=None, help="is_new 对比基准文件(默认自动取同关键词同城市、日期早于本轮的最近一份结果)")
     p.add_argument("--detail-output", default=None, help="可选：额外保存独立详情文件（默认详情直接写入 --output）")
@@ -3384,6 +3521,7 @@ def main():
                 stop_threshold=args.stop_threshold, stop_mode=args.stop_mode,
                 stop_consecutive=args.stop_consecutive,
                 resume=args.resume,
+                relevance_policy=args.relevance_policy,
             )
         except (LoginGateError, ValueError, OSError, RuntimeError) as e:
             print(str(e))
@@ -3456,7 +3594,7 @@ def main():
         analyze(list_data, details, search_keyword=args.keyword)
 
     # 抓取正常结束后按需收尾（仅成功路径；异常/登录失败走 sys.exit，不会触发，保留登录态）
-    if args.close_chrome:
+    if args.close_chrome and list_data.get("stop_reason") not in RESUMABLE_STOPS:
         profile = prepare_cdp_profile(copy_login_state=False, reset=False)
         stopped = stop_cdp_chrome(profile["path"])
         if stopped:
